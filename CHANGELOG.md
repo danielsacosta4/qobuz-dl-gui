@@ -1,0 +1,12 @@
+# Changelog
+
+## 0.9.0 — beta (2026-10-15)
+
+First public build, for testing before 1.0.
+
+- Search with release type, official-release check (MusicBrainz), edition, explicit, quality and "already have it" columns; filters and hidden releases/labels
+- Downloads with per-download options, queue remembered between launches, tray icon and notifications
+- Library tab: send albums to `Letter/Artist/Album`, replace lower-quality copies (hidden bin), verified copies
+- Library health: Library doctor and Complete my artists
+- Navidrome connection (library data, rescan after sending)
+- Update checks for qobuz-dl and this app
