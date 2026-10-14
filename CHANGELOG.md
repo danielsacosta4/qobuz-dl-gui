@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.1 — beta (2026-10-15)
+
+- Fixed: the app didn't start (the update-check code was attached to the wrong tab)
+
 ## 0.9.0 — beta (2026-10-15)
 
 First public build, for testing before 1.0.

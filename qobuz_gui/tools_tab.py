@@ -68,6 +68,118 @@ class SyncTab(QWidget):
         self.btn.clicked.connect(self._sync)
         self.reload_settings()
 
+    def reload_settings(self):
+        cfg = config.load()
+        self.folder.setText(_default_folder())
+        set_quality(self.quality, config.get(cfg, "default_quality", "27"))
+
+    def _sync(self):
+        url = self.url.text().strip()
+        if "/playlist/" not in url:
+            QMessageBox.information(self, "Playlist link needed", "Paste a Qobuz playlist link.")
+            return
+        args = ["sp", url, "-q", str(self.quality.currentData())]
+        if self.folder.text():
+            args += ["-d", os.path.expanduser(self.folder.text())]
+        if self.no_confirm.isChecked():
+            args.append("-y")
+        self.runner.enqueue(Job(f"Sync {describe(url)}", args))
+
+
+class ToolsTab(QWidget):
+    def __init__(self, runner, parent=None):
+        super().__init__(parent)
+        self.runner = runner
+
+        # Lyrics
+        self.lyrics_dir = FolderPicker("Music folder to scan")
+        btn_lyrics = QPushButton("Add missing lyrics")
+        lyr = QGroupBox("Add lyrics to music you already have")
+        l1 = QVBoxLayout(lyr)
+        l1.addWidget(_note("Scans the folder (and subfolders) for FLAC/MP3 files without lyrics and adds "
+                           "them from Qobuz, LRCLIB or Genius. No audio is downloaded."))
+        row = QHBoxLayout()
+        row.addWidget(self.lyrics_dir, 1)
+        row.addWidget(btn_lyrics)
+        l1.addLayout(row)
+
+        # History database
+        self.db_dir = FolderPicker("Library folder to scan")
+        btn_syncdb = QPushButton("Rebuild history from folder")
+        btn_stats = QPushButton("Downloaded artists…")
+        btn_purge = QPushButton("Clear download history…")
+        db = QGroupBox("Download history")
+        l2 = QVBoxLayout(db)
+        l2.addWidget(_note("qobuz-dl remembers what it downloaded and skips it next time. Rebuilding reads "
+                           "the tags of files you already have so they are skipped too."))
+        row2 = QHBoxLayout()
+        row2.addWidget(self.db_dir, 1)
+        row2.addWidget(btn_syncdb)
+        l2.addLayout(row2)
+        row3 = QHBoxLayout()
+        row3.addWidget(btn_stats)
+        row3.addWidget(btn_purge)
+        row3.addStretch(1)
+        l2.addLayout(row3)
+
+        # Files
+        btn_cfg = QPushButton("Open config folder")
+        btn_dl = QPushButton("Open download folder")
+        files = QGroupBox("Files")
+        l3 = QHBoxLayout(files)
+        l3.addWidget(btn_dl)
+        l3.addWidget(btn_cfg)
+        l3.addStretch(1)
+
+        # Updates
+        self.update_label = QLabel("")
+        self.update_label.setWordWrap(True)
+        self.update_label.setTextFormat(Qt.RichText)
+        self.update_label.setOpenExternalLinks(True)
+        self.btn_check = QPushButton("Check now")
+        self.btn_update = QPushButton("Update qobuz-dl from GitHub")
+        self.btn_update.setToolTip("Installs the latest code from github.com/Sei969/qobuz-dl into this app. "
+                                   "It runs in the queue, after any downloads already waiting.")
+        self.gui_label = QLabel("")
+        self.gui_label.setWordWrap(True)
+        self.gui_label.setTextFormat(Qt.RichText)
+        self.gui_label.setOpenExternalLinks(True)
+        self.btn_gui_update = QPushButton("Update this app from GitHub")
+        self.btn_gui_update.setVisible(False)
+        upd = QGroupBox("Updates")
+        l4 = QVBoxLayout(upd)
+        l4.addWidget(self.update_label)
+        row4 = QHBoxLayout()
+        row4.addWidget(self.btn_check)
+        row4.addWidget(self.btn_update)
+        row4.addStretch(1)
+        l4.addLayout(row4)
+        l4.addWidget(self.gui_label)
+        row5 = QHBoxLayout()
+        row5.addWidget(self.btn_gui_update)
+        row5.addStretch(1)
+        l4.addLayout(row5)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(lyr)
+        lay.addWidget(db)
+        lay.addWidget(upd)
+        lay.addWidget(files)
+        lay.addStretch(1)
+
+        self.btn_check.clicked.connect(lambda: self.check_updates(manual=True))
+        self.btn_gui_update.clicked.connect(self.run_gui_update)
+        self.show_gui_info(prefs.get_json(prefs.GUI_UPDATE_INFO, None))
+        self.btn_update.clicked.connect(self.run_update)
+        self.show_update_info(prefs.get_json(prefs.UPDATE_INFO, None))
+        btn_lyrics.clicked.connect(self._lyrics)
+        btn_syncdb.clicked.connect(self._sync_db)
+        btn_stats.clicked.connect(self._stats)
+        btn_purge.clicked.connect(self._purge)
+        btn_cfg.clicked.connect(lambda: self._open(config.CONFIG_PATH))
+        btn_dl.clicked.connect(lambda: self._open(os.path.expanduser(_default_folder() or "~")))
+        self.reload_settings()
+
     # ---- updates -------------------------------------------------------------
     def show_update_info(self, info, error=""):
         local = updates.installed_version()
@@ -183,118 +295,6 @@ class SyncTab(QWidget):
             return
         self.runner.enqueue(Job("Update qobuz-dl from GitHub", [], program=updates.update_command(),
                                 success_text="Successfully installed"))
-
-    def reload_settings(self):
-        cfg = config.load()
-        self.folder.setText(_default_folder())
-        set_quality(self.quality, config.get(cfg, "default_quality", "27"))
-
-    def _sync(self):
-        url = self.url.text().strip()
-        if "/playlist/" not in url:
-            QMessageBox.information(self, "Playlist link needed", "Paste a Qobuz playlist link.")
-            return
-        args = ["sp", url, "-q", str(self.quality.currentData())]
-        if self.folder.text():
-            args += ["-d", os.path.expanduser(self.folder.text())]
-        if self.no_confirm.isChecked():
-            args.append("-y")
-        self.runner.enqueue(Job(f"Sync {describe(url)}", args))
-
-
-class ToolsTab(QWidget):
-    def __init__(self, runner, parent=None):
-        super().__init__(parent)
-        self.runner = runner
-
-        # Lyrics
-        self.lyrics_dir = FolderPicker("Music folder to scan")
-        btn_lyrics = QPushButton("Add missing lyrics")
-        lyr = QGroupBox("Add lyrics to music you already have")
-        l1 = QVBoxLayout(lyr)
-        l1.addWidget(_note("Scans the folder (and subfolders) for FLAC/MP3 files without lyrics and adds "
-                           "them from Qobuz, LRCLIB or Genius. No audio is downloaded."))
-        row = QHBoxLayout()
-        row.addWidget(self.lyrics_dir, 1)
-        row.addWidget(btn_lyrics)
-        l1.addLayout(row)
-
-        # History database
-        self.db_dir = FolderPicker("Library folder to scan")
-        btn_syncdb = QPushButton("Rebuild history from folder")
-        btn_stats = QPushButton("Downloaded artists…")
-        btn_purge = QPushButton("Clear download history…")
-        db = QGroupBox("Download history")
-        l2 = QVBoxLayout(db)
-        l2.addWidget(_note("qobuz-dl remembers what it downloaded and skips it next time. Rebuilding reads "
-                           "the tags of files you already have so they are skipped too."))
-        row2 = QHBoxLayout()
-        row2.addWidget(self.db_dir, 1)
-        row2.addWidget(btn_syncdb)
-        l2.addLayout(row2)
-        row3 = QHBoxLayout()
-        row3.addWidget(btn_stats)
-        row3.addWidget(btn_purge)
-        row3.addStretch(1)
-        l2.addLayout(row3)
-
-        # Files
-        btn_cfg = QPushButton("Open config folder")
-        btn_dl = QPushButton("Open download folder")
-        files = QGroupBox("Files")
-        l3 = QHBoxLayout(files)
-        l3.addWidget(btn_dl)
-        l3.addWidget(btn_cfg)
-        l3.addStretch(1)
-
-        # Updates
-        self.update_label = QLabel("")
-        self.update_label.setWordWrap(True)
-        self.update_label.setTextFormat(Qt.RichText)
-        self.update_label.setOpenExternalLinks(True)
-        self.btn_check = QPushButton("Check now")
-        self.btn_update = QPushButton("Update qobuz-dl from GitHub")
-        self.btn_update.setToolTip("Installs the latest code from github.com/Sei969/qobuz-dl into this app. "
-                                   "It runs in the queue, after any downloads already waiting.")
-        self.gui_label = QLabel("")
-        self.gui_label.setWordWrap(True)
-        self.gui_label.setTextFormat(Qt.RichText)
-        self.gui_label.setOpenExternalLinks(True)
-        self.btn_gui_update = QPushButton("Update this app from GitHub")
-        self.btn_gui_update.setVisible(False)
-        upd = QGroupBox("Updates")
-        l4 = QVBoxLayout(upd)
-        l4.addWidget(self.update_label)
-        row4 = QHBoxLayout()
-        row4.addWidget(self.btn_check)
-        row4.addWidget(self.btn_update)
-        row4.addStretch(1)
-        l4.addLayout(row4)
-        l4.addWidget(self.gui_label)
-        row5 = QHBoxLayout()
-        row5.addWidget(self.btn_gui_update)
-        row5.addStretch(1)
-        l4.addLayout(row5)
-
-        lay = QVBoxLayout(self)
-        lay.addWidget(lyr)
-        lay.addWidget(db)
-        lay.addWidget(upd)
-        lay.addWidget(files)
-        lay.addStretch(1)
-
-        self.btn_check.clicked.connect(lambda: self.check_updates(manual=True))
-        self.btn_gui_update.clicked.connect(self.run_gui_update)
-        self.show_gui_info(prefs.get_json(prefs.GUI_UPDATE_INFO, None))
-        self.btn_update.clicked.connect(self.run_update)
-        self.show_update_info(prefs.get_json(prefs.UPDATE_INFO, None))
-        btn_lyrics.clicked.connect(self._lyrics)
-        btn_syncdb.clicked.connect(self._sync_db)
-        btn_stats.clicked.connect(self._stats)
-        btn_purge.clicked.connect(self._purge)
-        btn_cfg.clicked.connect(lambda: self._open(config.CONFIG_PATH))
-        btn_dl.clicked.connect(lambda: self._open(os.path.expanduser(_default_folder() or "~")))
-        self.reload_settings()
 
     def reload_settings(self):
         folder = _default_folder()
