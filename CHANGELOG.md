@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.2 — beta (2026-10-15)
+
+- Fixed: albums whose names carry a tag suffix such as `[2023, WEB]` weren't recognised as already in the library (✔ marks, warnings, Library doctor, Complete my artists)
+
 ## 0.9.1 — beta (2026-10-15)
 
 - Fixed: the app didn't start (the update-check code was attached to the wrong tab)

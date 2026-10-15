@@ -324,6 +324,14 @@ def remove_staged(path, staging):
         parent = os.path.dirname(parent)
 
 
+_BRACKETS = re.compile(r"\s*(\[[^\]]*\]|\([^)]*\))")
+
+
+def _strip_brackets(text):
+    """Drops [..] and (..) parts: tagging suffixes like "[2023, WEB]" and editions like "(Deluxe)"."""
+    return _BRACKETS.sub("", str(text or "")).strip()
+
+
 _EDITION_WORDS = {"deluxe", "edition", "remastered", "remaster", "anniversary", "expanded", "version",
                   "explicit", "clean", "special", "super", "bonus", "track", "tracks", "reissue", "hi", "res",
                   "the", "complete", "collector", "collectors", "mono", "stereo", "mix", "s"}
@@ -352,7 +360,12 @@ class LibraryIndex:
         idx = cls()
         idx.source = "navidrome"
         for al in albums:
-            idx.artists.setdefault(_norm(al.get("artist", "")), []).append(_norm(al.get("name", "")))
+            names = idx.artists.setdefault(_norm(al.get("artist", "")), [])
+            name = al.get("name", "")
+            names.append(_norm(name))
+            bare = _norm(_strip_brackets(name))
+            if bare and bare != names[-1]:
+                names.append(bare)   # "UK GRIM [2023, WEB]" -> "uk grim"
         idx._load_history(db_path)
         return idx
 
@@ -396,9 +409,11 @@ class LibraryIndex:
         a_norm, t = _norm(artist), _norm(title)
         albums = self.artists.get(a_norm)
         if albums and t and self.source == "navidrome":
+            titles = {t, _norm(_strip_brackets(title))} - {""}
             for name in albums:
-                if name == t or _edition_only(name, t) or _edition_only(t, name):
-                    return "library"
+                for tt in titles:
+                    if name == tt or _edition_only(name, tt) or _edition_only(tt, name):
+                        return "library"
             albums = None
         if albums and t:
             pattern = re.compile(rf"(^| ){re.escape(t)}( |$)")

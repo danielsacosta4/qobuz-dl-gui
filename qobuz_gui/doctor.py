@@ -7,6 +7,7 @@ Everything is cached, so a second scan only fetches what changed.
 """
 
 import os
+import re
 import time
 from dataclasses import asdict, dataclass, field
 
@@ -62,7 +63,8 @@ class ArtistCompletion:
 
 # ---- helpers ---------------------------------------------------------------------
 def _title_key(t):
-    return musicbrainz.norm_title(t)
+    # square-bracket suffixes from tagging ("[2023, WEB]") never belong to the title
+    return musicbrainz.norm_title(re.sub(r"\s*\[[^\]]*\]", "", str(t or "")))
 
 
 def _qobuz_quality(a):
