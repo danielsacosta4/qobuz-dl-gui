@@ -284,6 +284,11 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    if "--report" in sys.argv:
+        # headless: measure the library and write a report folder, no window
+        from . import report
+        i = sys.argv.index("--report")
+        return report.main(sys.argv[i + 1:i + 2])
     app = QApplication(sys.argv)
     app.setApplicationName("qobuz-dl-gui")
     app.setApplicationDisplayName(APP_NAME)

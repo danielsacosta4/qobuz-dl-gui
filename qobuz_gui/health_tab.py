@@ -85,7 +85,11 @@ class HealthTab(QWidget):
         self.last_scan = QLabel("")
         self.last_scan.setEnabled(False)
         bar = QHBoxLayout()
+        self.btn_report = QPushButton("Library report")
+        self.btn_report.setToolTip("Measure the library against the rules and write a report folder "
+                                   "(numbers, CSV lists, a spot-check sample). Nothing is changed.")
         bar.addWidget(self.btn_scan)
+        bar.addWidget(self.btn_report)
         bar.addWidget(self.btn_stop)
         bar.addWidget(self.use_mb)
         bar.addWidget(self.progress, 1)
@@ -107,6 +111,9 @@ class HealthTab(QWidget):
         lay.addWidget(self.tabs, 1)
 
         self.btn_scan.clicked.connect(self.scan)
+        self.btn_report.clicked.connect(self.run_report)
+        self._report_dir = None
+        self.download_tab.runner.jobChanged.connect(self._report_job_changed)
         self.btn_stop.clicked.connect(self._stop)
         self.use_mb.toggled.connect(lambda on: prefs.set_value("doctor_use_mb", on))
 
@@ -474,6 +481,29 @@ class HealthTab(QWidget):
                                 f"artist{'s' if len(sel) != 1 else ''}?") != QMessageBox.Yes:
             return
         self._queue_missing(entries)
+
+    # ================= report ====================================================
+    def run_report(self):
+        import datetime
+        import sys
+        from .jobs import Job
+        if not navidrome.configured():
+            QMessageBox.information(self, "Library report", "Set up the Navidrome connection in Settings first.")
+            return
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
+        self._report_dir = os.path.expanduser(f"~/qobuz-dl-gui-report-{stamp}")
+        self.download_tab.runner.enqueue(Job("Library report", [], program=[
+            sys.executable, "-u", "-m", "qobuz_gui.report", self._report_dir]))
+        self.status(f"Library report queued — it will be written to {self._report_dir}")
+
+    def _report_job_changed(self, job):
+        if job.title != "Library report" or job.status not in ("done", "failed"):
+            return
+        if job.status == "done" and self._report_dir and os.path.isdir(self._report_dir):
+            self.status(f"Library report ready: {self._report_dir}")
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._report_dir))
+        elif job.status == "failed":
+            self.status("The library report failed — see the log.", error=True)
 
     # ================= scanning ==================================================
     def scan(self):
