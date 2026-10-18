@@ -28,8 +28,10 @@ and uses its own `~/.config/qobuz-dl/config.ini`, so the app and the `qobuz-dl` 
   verifying every copy. Same album already there in another quality? Replace it, keep both or skip; replaced copies go
   to a hidden bin until you empty it. Navidrome rescans afterwards.
 - **Library health**
-  - *Library doctor*: CD-quality-or-lower albums available in Hi-Res, clean albums with an explicit version, albums
-    missing tracks, missing covers, albums Navidrome shows split in several, unofficial releases — each with a fix.
+  - *Library doctor*: checks the library against five written rules ([RULES.md](RULES.md)) — one copy of each album,
+    best quality, explicit versions, Letter/Artist/Album location, one album per release in Navidrome — plus missing
+    tracks, missing covers and unofficial releases. Each problem has a fix (previewed, verified, undoable) or can be
+    marked as an exception.
   - *Complete my artists*: official studio albums owned vs. available, per artist, with the missing ones one click away.
 - **Playlist sync**, **Library tools** (lyrics, download history), tray icon with notifications, remembered options and
   queue, and update checks for both qobuz-dl and this app.

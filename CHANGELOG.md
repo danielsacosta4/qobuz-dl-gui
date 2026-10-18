@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.5 — beta (2026-10-18)
+
+The library rules (see RULES.md):
+- The Library doctor now checks five written rules — **R1 one copy, R2 best quality, R3 explicit, R4 location,
+  R5 one album in Navidrome** — and shows a line with how many albums break each one.
+- New checks: **R1 duplicates** (fix keeps the best copy, moves the others to the bin) and **R4 wrong letter**
+  (fix moves the artist folder to the right letter; refuses if one is already there). Both can be undone.
+- "Ignore" is now **Mark as exception**; choosing *Keep both* when sending records an R1 exception.
+- Better matching with Qobuz: joined artists ("Neil Young • Crazy Horse") are looked up one by one, qualifiers
+  like "(Radio Edit)" are tried without, and releases by a different artist with the same title are rejected.
+  On a real 4,856-album library this raised albums matched on Qobuz from 80% to 93%.
+- Editions (deluxe, remaster…) count as one album; language versions, live recordings and volumes don't.
+- R5 no longer reports unrelated artists who share a song title (cover versions): 28 → 9, all genuine.
+- Sending shows each stage: **Copying** a file, then **Checking** it as it's read back from the share.
+
 ## 0.9.4 — beta (2026-10-18)
 
 Safe writes to the library:

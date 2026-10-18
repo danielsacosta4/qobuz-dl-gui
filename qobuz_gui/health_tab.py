@@ -11,13 +11,15 @@ from PySide6.QtWidgets import (
     QProgressBar, QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from . import doctor, history, musicbrainz, navidrome, prefs, safeio
+from . import doctor, history, musicbrainz, navidrome, prefs, rules, safeio
 from .client import run_async
 from .library_tab import library_folder
 
-IGNORED = "doctor_ignored"
+IGNORED = rules.EXCEPTIONS
 GREEN, AMBER, RED = QColor("#3fa65a"), QColor("#c99a2e"), QColor("#e5534b")
 FIX_TEXT = {
+    doctor.DUPLICATE: "Move the extra copies to the replaced bin",
+    doctor.LOCATION: "Move the artist folder to the right letter",
     doctor.UPGRADE: "Download better version",
     doctor.EXPLICIT: "Download explicit version",
     doctor.MISSING_TRACKS: "Download full album",
@@ -127,9 +129,15 @@ class HealthTab(QWidget):
     def _build_doctor(self):
         self.kind_filter = QComboBox()
         self.kind_filter.addItem("All problems", "")
+        self.kind_filter.addItem("Rule breaks only (R1–R5)", "rules")
         for k, label in doctor.LABELS.items():
             self.kind_filter.addItem(label, k)
-        self.show_ignored = QCheckBox("Show ignored")
+        self.show_ignored = QCheckBox("Show exceptions")
+        self.show_ignored.setToolTip("Problems you marked as accepted exceptions")
+        self.rules_line = QLabel("")
+        self.rules_line.setTextFormat(Qt.RichText)
+        self.rules_line.setWordWrap(True)
+        self.rules_line.setToolTip("\n\n".join(f"{k} {n}: {t}" for k, (n, t) in rules.RULES.items()))
         self.summary = QLabel("")
         top = QHBoxLayout()
         top.addWidget(QLabel("Show:"))
@@ -154,8 +162,9 @@ class HealthTab(QWidget):
         self.btn_all = QPushButton("Tick all shown")
         self.btn_none = QPushButton("Untick all")
         self.btn_fix = QPushButton("Fix ticked")
-        self.btn_ignore = QPushButton("Ignore ticked")
-        self.btn_ignore.setToolTip("Hide these from future scans (Show ignored brings them back)")
+        self.btn_ignore = QPushButton("Mark as exception")
+        self.btn_ignore.setToolTip("Accept these as they are: they no longer count as rule breaks "
+                                   "(Show exceptions brings them back)")
         self.btn_folder = QPushButton("Open folder")
         self.fix_hint = QLabel("")
         self.fix_hint.setEnabled(False)
@@ -171,6 +180,7 @@ class HealthTab(QWidget):
         w = QWidget()
         v = QVBoxLayout(w)
         v.addLayout(top)
+        v.addWidget(self.rules_line)
         v.addWidget(self.table, 1)
         v.addLayout(actions)
 
@@ -187,11 +197,21 @@ class HealthTab(QWidget):
     def _ignored(self):
         return set(prefs.get_json(IGNORED, []) or [])
 
+    @staticmethod
+    def _is_exception(issue, stored):
+        return issue.key in stored or issue.legacy_key in stored
+
     def _fill_issues(self):
         kind = self.kind_filter.currentData()
-        ignored = self._ignored()
+        stored = self._ignored()
+        ignored = {i.key for i in self.issues if self._is_exception(i, stored)}
+
+        def wanted(i):
+            if kind == "rules":
+                return bool(i.rule)
+            return not kind or i.kind == kind
         shown = [i for i in self.issues
-                 if (not kind or i.kind == kind) and (self.show_ignored.isChecked() or i.key not in ignored)]
+                 if wanted(i) and (self.show_ignored.isChecked() or i.key not in ignored)]
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(shown))
         for r, issue in enumerate(shown):
@@ -200,10 +220,11 @@ class HealthTab(QWidget):
             check.setCheckState(Qt.Unchecked)
             check.setData(Qt.UserRole, self.issues.index(issue))
             self.table.setItem(r, 0, check)
-            colour = AMBER if issue.kind in (doctor.UNOFFICIAL, doctor.SPLIT, doctor.MISSING_TRACKS) else None
+            colour = AMBER if issue.kind in (doctor.UNOFFICIAL, doctor.SPLIT, doctor.MISSING_TRACKS,
+                                             doctor.DUPLICATE, doctor.LOCATION) else None
             label = issue.extra.get("label") or doctor.LABELS[issue.kind]
             if issue.key in ignored:
-                label += " (ignored)"
+                label += " (exception)"
             self.table.setItem(r, 1, _cell(label, colour=colour))
             self.table.setItem(r, 2, _cell(issue.artist))
             self.table.setItem(r, 3, _cell(issue.album, tip=issue.folder or issue.album))
@@ -213,8 +234,19 @@ class HealthTab(QWidget):
         for i in self.issues:
             if i.key not in ignored:
                 counts[i.kind] = counts.get(i.kind, 0) + 1
-        self.summary.setText(" · ".join(f"{doctor.LABELS[k]}: {n}" for k, n in counts.items()) or
-                             ("No problems found." if self.issues is not None else ""))
+        self.summary.setText(" · ".join(f"{doctor.LABELS[k]}: {n}" for k, n in counts.items()
+                                        if not doctor.RULE_OF.get(k)) or "")
+        # one line per rule: how many breaks, how many accepted exceptions
+        parts = []
+        for code, (name, _text) in rules.RULES.items():
+            kinds = [k for k, r in doctor.RULE_OF.items() if r == code]
+            breaks = sum(1 for i in self.issues if i.kind in kinds and i.key not in ignored)
+            exc = sum(1 for i in self.issues if i.kind in kinds and i.key in ignored)
+            mark = "✔" if not breaks else "✘"
+            colour = "#3fa65a" if not breaks else "#c99a2e"
+            parts.append(f"<span style='color:{colour}'>{mark}</span> <b>{code}</b> {html.escape(name)}: "
+                         f"{breaks}" + (f" <i>(+{exc} exception{'s' if exc != 1 else ''})</i>" if exc else ""))
+        self.rules_line.setText("&nbsp;&nbsp;·&nbsp;&nbsp;".join(parts) if self.issues is not None else "")
 
     def _issue_rows(self, ticked=True):
         out = []
@@ -259,6 +291,8 @@ class HealthTab(QWidget):
         covers = [i for i in ticked if i.kind == doctor.NO_COVER]
         splits = [i for i in ticked if i.kind == doctor.SPLIT]
         bins = [i for i in ticked if i.kind == doctor.UNOFFICIAL]
+        dupes = [i for i in ticked if i.kind == doctor.DUPLICATE]
+        moves = [i for i in ticked if i.kind == doctor.LOCATION]
         lines = []
         if downloads:
             lines.append(f"• Queue {len(downloads)} download{'s' if len(downloads) != 1 else ''}. When they finish, "
@@ -271,6 +305,14 @@ class HealthTab(QWidget):
         if bins:
             lines.append(f"• Move {len(bins)} album{'s' if len(bins) != 1 else ''} to the hidden replaced bin "
                          "(nothing is deleted until you empty it in the Library tab).")
+        if dupes:
+            lines.append(f"• For {len(dupes)} album{'s' if len(dupes) != 1 else ''} in the library more than once, "
+                         "keep the best copy and move the others to the hidden replaced bin.")
+        if moves:
+            lines.append(f"• Move {len(moves)} artist folder{'s' if len(moves) != 1 else ''} to the right letter.")
+        if not lines:
+            self.status("None of the ticked problems can be fixed automatically.")
+            return
         if QMessageBox.question(self, "Fix problems", "\n\n".join(lines)) != QMessageBox.Yes:
             return
 
@@ -278,7 +320,7 @@ class HealthTab(QWidget):
         for i in downloads:
             self.download_tab.enqueue([i.url], title=f"{i.artist} — {i.album} ({doctor.LABELS[i.kind].lower()})")
 
-        file_fixes = covers + splits + bins
+        file_fixes = covers + splits + bins + dupes + moves
         if not file_fixes:
             self.status(f"Queued {len(downloads)} download{'s' if len(downloads) != 1 else ''}.")
             return
@@ -302,6 +344,22 @@ class HealthTab(QWidget):
                         r.raise_for_status()
                         plan = safeio.Plan(f"Add cover — {i.artist} — {i.album}", lib)
                         plan.add_file(os.path.join(i.folder, "cover.jpg"), r.content)
+                    elif i.kind == doctor.DUPLICATE:
+                        retire = [f for f in i.extra.get("retire") or [] if os.path.isdir(f)]
+                        if not retire:
+                            raise ValueError("couldn't confirm which folders are the extra copies — "
+                                             "open the folder and sort it by hand, or mark it as an exception")
+                        plan = safeio.Plan(f"Keep one copy — {i.artist} — {i.album}", lib)
+                        for f in retire:
+                            plan.retire(f)
+                    elif i.kind == doctor.LOCATION:
+                        dst = i.extra.get("to") or ""
+                        if not dst:
+                            raise ValueError("this folder needs sorting by hand")
+                        if os.path.lexists(dst):
+                            raise ValueError(f"{dst} already exists — merge the two folders by hand")
+                        plan = safeio.Plan(f"Move {i.artist} to {os.path.basename(os.path.dirname(dst))}", lib)
+                        plan.relocate(i.folder, dst)
                     elif i.kind == doctor.SPLIT:
                         artist = i.extra.get("album_artist") or i.artist
                         plan = safeio.Plan(f"One album artist ({artist}) — {i.album}", lib)
@@ -576,7 +634,8 @@ class HealthTab(QWidget):
             return
         doctor.save_results(issues, completion)
         self._show_results(issues, completion, None, partial=stopped)
-        n = sum(1 for i in issues if i.key not in self._ignored())
+        stored = self._ignored()
+        n = sum(1 for i in issues if not self._is_exception(i, stored))
         self.status(f"Library scan {'stopped' if stopped else 'finished'}: {n} problem{'s' if n != 1 else ''} found.")
 
     def _show_results(self, issues, completion, when, partial=False):

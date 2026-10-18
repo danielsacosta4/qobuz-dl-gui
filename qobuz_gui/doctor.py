@@ -11,7 +11,7 @@ import re
 import time
 from dataclasses import asdict, dataclass, field
 
-from . import cache, classify, library, musicbrainz, navidrome
+from . import cache, classify, library, matching, musicbrainz, navidrome, rules
 
 QOBUZ_TTL = 7 * cache.DAY
 QOBUZ_GAP = 0.6          # seconds between Qobuz API calls
@@ -24,15 +24,23 @@ MISSING_TRACKS = "missing_tracks"
 NO_COVER = "no_cover"
 SPLIT = "split"
 UNOFFICIAL = "unofficial"
+DUPLICATE = "duplicate"
+LOCATION = "location"
 
 LABELS = {
-    UPGRADE: "Hi-Res available",
-    EXPLICIT: "Explicit version available",
+    DUPLICATE: "R1 · More than one copy",
+    UPGRADE: "R2 · Hi-Res available",
+    EXPLICIT: "R3 · Explicit version available",
+    LOCATION: "R4 · Wrong letter folder",
     MISSING_TRACKS: "Missing tracks",
     NO_COVER: "No cover",
-    SPLIT: "Album split in Navidrome",
+    SPLIT: "R5 · Album split in Navidrome",
     UNOFFICIAL: "Unofficial release",
 }
+
+# which rule each problem breaks ("" = a check outside the rules)
+RULE_OF = {DUPLICATE: "R1", UPGRADE: "R2", EXPLICIT: "R3", LOCATION: "R4", SPLIT: "R5",
+           MISSING_TRACKS: "", NO_COVER: "", UNOFFICIAL: ""}
 
 
 @dataclass
@@ -49,7 +57,15 @@ class Issue:
 
     @property
     def key(self):
-        return f"{self.kind}|{self.artist.lower()}|{self.album.lower()}"
+        return rules.exception_key(self.kind, self.artist, self.album)
+
+    @property
+    def legacy_key(self):
+        return rules.legacy_key(self.kind, self.artist, self.album)
+
+    @property
+    def rule(self):
+        return RULE_OF.get(self.kind, "")
 
 
 @dataclass
@@ -63,8 +79,7 @@ class ArtistCompletion:
 
 # ---- helpers ---------------------------------------------------------------------
 def _title_key(t):
-    # square-bracket suffixes from tagging ("[2023, WEB]") never belong to the title
-    return musicbrainz.norm_title(re.sub(r"\s*\[[^\]]*\]", "", str(t or "")))
+    return matching.title_key(t)
 
 
 def _qobuz_quality(a):
@@ -87,6 +102,28 @@ def _slim(a, artist_name):
         "artist": {"name": (a.get("artist") or {}).get("name", artist_name)},
         "image": {"large": img.get("large") or img.get("small") or ""},
     }
+
+
+def _common_dir(paths):
+    dirs = {os.path.dirname(p.replace("\\", "/")) for p in paths if p}
+    if not dirs:
+        return ""
+    common = os.path.commonpath(list(dirs)) if len(dirs) > 1 else dirs.pop()
+    # multi-disc albums keep discs in sub-folders ("CD1"): the album is their parent
+    return common.strip("/")
+
+
+def folder_from_details(library_root, details):
+    """The album's folder on the share, from Navidrome's song paths, when it can be confirmed."""
+    rel = (details or {}).get("dir") or ""
+    if not library_root or not rel:
+        return ""
+    path = os.path.normpath(os.path.join(library_root, rel))
+    root = os.path.normpath(library_root)
+    # must be Letter/Artist/Album inside the library, never the library or a letter folder itself
+    if not path.startswith(root + os.sep) or len(os.path.relpath(path, root).split(os.sep)) < 3:
+        return ""
+    return path if os.path.isdir(path) else ""
 
 
 def locate_folder(library_root, artist, album_name, extra_artists=()):
@@ -135,6 +172,10 @@ class Scanner:
             time.sleep(gap)
         self._last_qobuz = time.time()
 
+    def discography_for(self, names):
+        """Merged Qobuz discography for every name an artist goes by ("A • B" -> A, B)."""
+        return matching.merge_discographies(self.qobuz_discography(n) for n in names)
+
     def qobuz_discography(self, artist_name):
         key = _title_key(artist_name)
         cached = cache.get("qobuz_artist", key, QOBUZ_TTL)
@@ -157,7 +198,7 @@ class Scanner:
     # ---- Navidrome details (cached by album id + change stamp)
     @staticmethod
     def album_details(nd, album):
-        stamp = f"{album.get('id')}|{album.get('songCount')}|{album.get('created')}|{album.get('changed', '')}"
+        stamp = f"v2|{album.get('id')}|{album.get('songCount')}|{album.get('created')}|{album.get('changed', '')}"
         cached = cache.get("nd_album", stamp)
         if cached is not None:
             return cached
@@ -168,6 +209,8 @@ class Scanner:
             "songs": len(songs),
             "cover": bool(d.get("coverArt")),
             "artists": sorted({s.get("artist", "") for s in songs if s.get("artist")}),
+            # the album's folder relative to the music folder, from Navidrome's own song paths
+            "dir": _common_dir([s.get("path", "") for s in songs]),
         }
         cache.put("nd_album", stamp, info)
         return info
@@ -182,14 +225,21 @@ class Scanner:
 
         issues, completion = [], []
         self._split_check(albums, issues)
+        self._location_check(issues)
+        details_by_id = {}
         artists = sorted(by_artist, key=str.casefold)
         for n, artist in enumerate(artists, 1):
             if self.should_stop():
                 break
             self.progress(n, len(artists), artist)
             lib_albums = by_artist[artist]
+            names = []
+            for al in lib_albums:
+                for n in matching.artist_names(artist, al):
+                    if n not in names:
+                        names.append(n)
             try:
-                qobuz = self.qobuz_discography(artist)
+                qobuz = self.discography_for(names)
             except Exception:
                 qobuz = []
             check = None
@@ -205,19 +255,21 @@ class Scanner:
                     details = self.album_details(nd, al)
                 except Exception:
                     continue
-                self._album_issues(artist, al, details, qobuz, check, issues)
+                details_by_id[al.get("id")] = details
+                self._album_issues(artist, al, details, qobuz, check, issues, names)
             if qobuz:
-                completion.append(self._completion(artist, lib_albums, qobuz, check))
+                completion.append(self._completion(artist, lib_albums, qobuz, check, names))
+        if not self.should_stop():
+            self._duplicate_check(albums, details_by_id, issues)
         return issues, completion
 
     # ---- checks
-    def _candidates(self, album_name, qobuz):
-        key = _title_key(album_name)
-        return [q for q in qobuz if _title_key(q["title"]) == key]
+    def _candidates(self, album_name, qobuz, names=None):
+        return matching.candidates(album_name, qobuz, names)
 
-    def _album_issues(self, artist, al, details, qobuz, check, issues):
+    def _album_issues(self, artist, al, details, qobuz, check, issues, names=None):
         name = al.get("name", "")
-        cands = self._candidates(name, qobuz)
+        cands = self._candidates(name, qobuz, names if names is not None else matching.artist_names(artist, al))
         quality = tuple(details.get("quality") or ())
         lib_explicit = navidrome.is_explicit(al)
 
@@ -284,29 +336,73 @@ class Scanner:
                 issues.append(Issue(UNOFFICIAL, artist, name, why, album_id=al.get("id", ""), folder=folder()))
 
     def _split_check(self, albums, issues):
-        """Same album name and year under several album artists usually means the album artist
-        tag is missing or inconsistent, so Navidrome shows it as several albums."""
-        groups = {}
-        for a in albums:
-            key = (_title_key(a.get("name")), str(a.get("year") or ""))
-            if key[0]:
-                groups.setdefault(key, []).append(a)
-        for (_t, _y), group in groups.items():
+        """R5: albums Navidrome shows as several entries (see rules.split_groups)."""
+        for group in rules.split_groups(albums):
             artists = sorted({g.get("artist", "") for g in group})
-            if len(group) < 2 or len(artists) < 2:
-                continue
             main = max(group, key=lambda g: int(g.get("songCount") or 0))
             name = main.get("name", "")
             others = [x for x in artists if x != main.get("artist")]
+            # the album artist to write: the shortest shared name, else the main entry's artist
+            shared = None
+            sets = [set(matching.artist_names(g.get("artist", ""), g)) for g in group]
+            common = set.intersection(*sets) if sets else set()
+            if common:
+                shared = min(common, key=len)
             issues.append(Issue(SPLIT, main.get("artist", ""), name,
-                                f"Shown as {len(group)} albums: {', '.join(artists)}",
+                                f"Shown as {len(group)} albums: {', '.join(artists[:6])}"
+                                + (" …" if len(artists) > 6 else ""),
                                 album_id=main.get("id", ""),
                                 folder=locate_folder(self.library_root, main.get("artist", ""), name, others),
-                                extra={"album_artist": main.get("artist", ""), "artists": artists}))
+                                extra={"album_artist": shared or ("Various Artists" if len(artists) >= 3
+                                                                  else main.get("artist", "")),
+                                       "artists": artists}))
 
-    def _completion(self, artist, lib_albums, qobuz, check):
+    def _location_check(self, issues):
+        """R4: artist folders under the wrong letter."""
+        if not self.library_root or not os.path.isdir(self.library_root):
+            return
+        for letter_name, artist, problem, right in rules.location_problems(rules.read_layout(self.library_root)):
+            src = os.path.join(self.library_root, letter_name, artist)
+            dst = os.path.join(self.library_root, right, artist) if right else ""
+            issues.append(Issue(LOCATION, artist or letter_name, "", problem.capitalize(), folder=src,
+                                extra={"to": dst}))
+
+    def _duplicate_check(self, albums, details_by_id, issues):
+        """R1: the same album more than once. Keeps the best copy (quality, then most tracks)."""
+        for group in rules.duplicate_groups(albums):
+            def rank(a):
+                d = details_by_id.get(a.get("id")) or {}
+                return (tuple(d.get("quality") or ()), int(a.get("songCount") or 0))
+            ordered = sorted(group, key=rank, reverse=True)
+            keep, extra = ordered[0], ordered[1:]
+            artist = keep.get("artist", "")
+            # only folders confirmed from Navidrome's own paths: guessing by title could pick the
+            # kept copy for both, or the wrong edition
+            folders = {}
+            for a in group:
+                f = folder_from_details(self.library_root, details_by_id.get(a.get("id")))
+                if f:
+                    folders[a.get("id")] = f
+            keep_folder = folders.get(keep.get("id"), "")
+            retire = []
+            for a in extra:
+                f = folders.get(a.get("id"))
+                if f and keep_folder and f != keep_folder and not keep_folder.startswith(f + os.sep) \
+                        and not f.startswith(keep_folder + os.sep) and f not in retire:
+                    retire.append(f)
+            names = " | ".join(a.get("name", "") for a in ordered)
+            issues.append(Issue(DUPLICATE, artist, keep.get("name", ""),
+                                f"{len(group)} copies: {names} — keeps “{keep.get('name', '')}”",
+                                album_id=keep.get("id", ""), folder=keep_folder,
+                                extra={"retire": retire, "copies": len(group)}))
+
+    def _completion(self, artist, lib_albums, qobuz, check, names=None):
         verified = check is not None and check.artist is not None
-        owned_keys = {_title_key(a.get("name")) for a in lib_albums}
+        names = names or matching.artist_names(artist)
+        qobuz = [q for q in qobuz if matching.artist_matches((q.get("artist") or {}).get("name", ""), names)]
+        owned_keys = set()
+        for a in lib_albums:
+            owned_keys |= matching.library_keys(a.get("name"))
         studio = {}
         for q in classify.prefer_explicit(classify.dedupe(qobuz)) if self.prefer_explicit else classify.dedupe(qobuz):
             if verified:

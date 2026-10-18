@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from . import config, history, library, prefs, safeio
+from . import config, history, library, prefs, rules, safeio
 from .client import run_async
 from .download_tab import FolderPicker
 
@@ -55,7 +55,8 @@ class SendWorker(QThread):
         self._stop = True
 
     def run(self):
-        total = sum(plan.total_bytes() for _, plan in self.jobs) or 1
+        # bytes are counted twice: written, then read back from the share and checked
+        total = 2 * sum(plan.total_bytes() for _, plan in self.jobs) or 1
         before = 0
         sent = failed = 0
         journal = history.journal()
@@ -78,7 +79,7 @@ class SendWorker(QThread):
             except Exception as e:
                 failed += 1
                 self.albumDone.emit(album.path, False, str(e))
-            before += plan.total_bytes()
+            before += 2 * plan.total_bytes()
         self.allDone.emit(sent, failed)
 
 
@@ -367,6 +368,11 @@ class LibraryTab(QWidget):
         if not jobs:
             self.status("Tick at least one album to send (rows set to \"Don't send\" are left out).")
             return
+        # "Keep both" is a deliberate choice: remember it so R1 doesn't report the pair later
+        kept = [rules.exception_key("duplicate", a.artist, library.clean_album_name(a.name))
+                for a, _, _ in jobs if a.others and a.action == "keep"]
+        if kept:
+            prefs.set_json(rules.EXCEPTIONS, sorted(set(prefs.get_json(rules.EXCEPTIONS, []) or []) | set(kept)))
         plans = []
         for album, dest, retire in jobs:
             plan = safeio.Plan(f"Send {album.artist} — {library.clean_album_name(album.name)}", lib)

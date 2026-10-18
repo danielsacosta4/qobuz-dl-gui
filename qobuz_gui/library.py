@@ -369,15 +369,23 @@ class LibraryIndex:
     @classmethod
     def from_navidrome(cls, albums, db_path):
         """Index built from Navidrome's album list (exact album names instead of folder names)."""
+        from . import matching
         idx = cls()
         idx.source = "navidrome"
         for al in albums:
-            names = idx.artists.setdefault(_norm(al.get("artist", "")), [])
             name = al.get("name", "")
-            names.append(_norm(name))
+            forms = [_norm(name)]
             bare = _norm(_strip_brackets(name))
-            if bare and bare != names[-1]:
-                names.append(bare)   # "UK GRIM [2023, WEB]" -> "uk grim"
+            if bare and bare not in forms:
+                forms.append(bare)   # "UK GRIM [2023, WEB]" -> "uk grim"
+            for k in matching.library_keys(name):
+                if k not in forms:
+                    forms.append(k)  # "Chevrolet (Radio Edit)" -> "chevrolet"
+            # filed under every artist it's credited to ("Neil Young • Crazy Horse" -> each)
+            for artist in matching.artist_names(al.get("artist", ""), al):
+                key = _norm(artist)
+                if key:
+                    idx.artists.setdefault(key, []).extend(forms)
         idx._load_history(db_path)
         return idx
 
@@ -420,9 +428,14 @@ class LibraryIndex:
         """'library', 'history' or '' for an album."""
         a_norm, t = _norm(artist), _norm(title)
         albums = self.artists.get(a_norm)
-        if albums and t and self.source == "navidrome":
-            titles = {t, _norm(_strip_brackets(title))} - {""}
-            for name in albums:
+        if t and self.source == "navidrome":
+            from . import matching
+            titles = {t, _norm(_strip_brackets(title))} | matching.qobuz_keys({"title": title})
+            titles -= {""}
+            pool = []
+            for name in matching.artist_names(artist):
+                pool.extend(self.artists.get(_norm(name)) or [])
+            for name in pool:
                 for tt in titles:
                     if name == tt or _edition_only(name, tt) or _edition_only(tt, name):
                         return "library"

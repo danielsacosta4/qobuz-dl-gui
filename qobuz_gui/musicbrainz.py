@@ -54,8 +54,9 @@ def _get(path, **params):
 
 
 # ---- matching helpers ----------------------------------------------------------
+# a bracket naming a live recording ("(Live At The Palace / 1999)") is a different release, not an edition
 _EDITION = re.compile(
-    r"[\[(][^\])]*(deluxe|remaster|anniversary|expanded|edition|version|bonus|explicit|clean|"
+    r"[\[(](?![^\])]*\blive\b)[^\])]*(deluxe|remaster|anniversary|expanded|edition|bonus|explicit|clean|"
     r"special|super|collector|reissue|mono|stereo|hi-?res|\d{4})[^\])]*[\])]", re.IGNORECASE)
 
 

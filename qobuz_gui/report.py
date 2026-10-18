@@ -8,7 +8,7 @@ It writes a folder with:
   report.md / report.json   the numbers (what's measured and how is written in report.md)
   unmatched.csv             your albums the app couldn't find on Qobuz (or couldn't match)
   not_recognised.csv        albums matched on Qobuz but NOT recognised as owned (the ✔ would be missing)
-  duplicates.csv            R1: albums present more than once (editions count as the same album)
+  duplicates.csv            R1: albums present more than once (editions = same album, languages = different)
   upgrades.csv              R2: CD quality or lower with a Hi-Res version on Qobuz
   explicit.csv              R3: clean copies where Qobuz has an explicit version
   location.csv              R4: folders not in Letter/Artist/Album
@@ -27,7 +27,7 @@ import random
 import sys
 import time
 
-from . import __version__, classify, doctor, library, navidrome, prefs
+from . import __version__, classify, doctor, library, matching, navidrome, prefs, rules
 
 DEFAULT_LIBRARY = "/mnt/navidrome/Music"
 
@@ -136,19 +136,28 @@ def run(out_dir=None):
     for n, artist in enumerate(artists, 1):
         if n == 1 or n % 25 == 0 or n == len(artists):
             _say(f"  artist {n} of {len(artists)} — {artist}")
-        try:
-            qobuz = scanner.qobuz_discography(artist)
-        except Exception as e:
-            _say(f"    Qobuz lookup failed for {artist}: {e}")
-            qobuz = []
-        discographies[artist] = qobuz
+        names = []
+        for al in by_artist[artist]:
+            for nm in matching.artist_names(artist, al):
+                if nm not in names:
+                    names.append(nm)
+        qobuz_lists = []
+        for nm in names:
+            try:
+                got = scanner.qobuz_discography(nm)
+            except Exception as e:
+                _say(f"    Qobuz lookup failed for {nm}: {e}")
+                got = []
+            discographies[nm] = got
+            qobuz_lists.append(got)
+        qobuz = matching.merge_discographies(qobuz_lists)
         for al in by_artist[artist]:
             name = al.get("name", "")
             if not qobuz:
                 artist_missing += 1
                 rows_unmatched.append((artist, name, al.get("year", ""), "artist not found on Qobuz"))
                 continue
-            cands = scanner._candidates(name, qobuz)
+            cands = scanner._candidates(name, qobuz, matching.artist_names(artist, al))
             if not cands:
                 rows_unmatched.append((artist, name, al.get("year", ""), "artist found, album not matched"))
                 continue
@@ -168,17 +177,12 @@ def run(out_dir=None):
                                        f"{doctor.WEB_URL}album/{c.get('id')}"))
             try:
                 details = scanner.album_details(nd, al)
-                scanner._album_issues(artist, al, details, qobuz, None, issues)
+                scanner._album_issues(artist, al, details, qobuz, None, issues, names)
             except Exception as e:
                 _say(f"    couldn't read {artist} — {name} from Navidrome: {e}")
 
     # R1 duplicates (editions count as the same album)
-    groups = {}
-    for a in albums:
-        key = (classify._norm(a.get("artist", "")), doctor._title_key(a.get("name", "")))
-        if key[1]:
-            groups.setdefault(key, []).append(a)
-    dup_groups = [g for g in groups.values() if len(g) > 1]
+    dup_groups = rules.duplicate_groups(albums)
     rows_dup = [(g[0].get("artist", ""), " | ".join(x.get("name", "") for x in g), len(g)) for g in dup_groups]
 
     # R5 split

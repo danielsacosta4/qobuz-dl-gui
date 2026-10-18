@@ -59,7 +59,7 @@ def preview(parent, title, plans, footer=""):
     dlg.setWindowTitle(title)
     dlg.resize(860, 520)
     total = sum(p.total_bytes() for p in plans)
-    head = QLabel(f"<b>{len(plans)} change{'s' if len(plans) != 1 else ''}</b> · {safeio._human(total)} to copy. "
+    head = QLabel(f"<b>{len(plans)} change{'s' if len(plans) != 1 else ''}</b> · {safeio._human(total)} to copy (each file is read back from the share and checked). "
                   "Nothing happens until you press <b>Go ahead</b>. Everything is recorded in History and can be undone.")
     head.setWordWrap(True)
     text = QPlainTextEdit()
@@ -89,7 +89,8 @@ def preview(parent, title, plans, footer=""):
 
 
 KIND_TEXT = {"copy": "Copied", "move": "Moved to bin", "trash": "Moved to Trash", "tags": "Tags rewritten",
-             "add_file": "Added", "mkdir": "Created folder", "purge": "Deleted permanently"}
+             "add_file": "Added", "mkdir": "Created folder", "purge": "Deleted permanently",
+             "rename": "Moved"}
 
 
 class HistoryDialog(QDialog):
@@ -162,7 +163,7 @@ class HistoryDialog(QDialog):
         for o in journal().ops(b["id"]):
             what = KIND_TEXT.get(o["kind"], o["kind"])
             path = o["dst"] if o["kind"] in ("copy", "add_file", "mkdir") else o["src"]
-            extra = f" → {o['dst']}" if o["kind"] in ("move", "trash") else ""
+            extra = f" → {o['dst']}" if o["kind"] in ("move", "trash", "rename") else ""
             lines.append(f"[{o['status']}] {what}: {path}{extra}")
         if b["note"]:
             lines.append("")

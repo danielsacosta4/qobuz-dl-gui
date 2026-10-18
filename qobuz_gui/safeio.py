@@ -74,13 +74,15 @@ def _inside(path, root):
 
 
 # ---- checksums -----------------------------------------------------------------------
-def sha256_file(path, uncached=False):
+def sha256_file(path, uncached=False, progress=None):
     h = hashlib.sha256()
     with open(path, "rb") as f:
         if uncached:
             _drop_cache(f.fileno())
         for block in iter(lambda: f.read(CHUNK), b""):
             h.update(block)
+            if progress:
+                progress(len(block))
     return h.hexdigest()
 
 
@@ -92,9 +94,11 @@ def _drop_cache(fd):
         pass
 
 
-def verified_copy(src, dst, progress=None):
+def verified_copy(src, dst, progress=None, checking=None):
     """Copies src → dst through a .part file, hashing while writing, then re-reads dst from the
-    share and compares. Returns the SHA-256. Raises OSError on a mismatch (dst is removed)."""
+    share and compares. Returns the SHA-256. Raises OSError on a mismatch (dst is removed).
+
+    progress(n) is called for bytes written; checking(n) for bytes read back (defaults to progress)."""
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     tmp = dst + ".part"
     h = hashlib.sha256()
@@ -108,7 +112,7 @@ def verified_copy(src, dst, progress=None):
         os.fsync(fo.fileno())
         _drop_cache(fo.fileno())
     expected = h.hexdigest()
-    got = sha256_file(tmp, uncached=True)
+    got = sha256_file(tmp, uncached=True, progress=checking or progress)
     if got != expected:
         try:
             os.remove(tmp)
@@ -263,6 +267,13 @@ def _undo_op(op):
         os.makedirs(os.path.dirname(src), exist_ok=True)
         shutil.move(dst, src)
         _remove_empty_dirs(os.path.dirname(dst), meta.get("stop_at"))
+    elif kind == "rename":
+        if not os.path.exists(dst):
+            raise SafetyError("it's no longer where it was moved to")
+        if os.path.lexists(src):
+            raise SafetyError("something new is in its old place")
+        os.makedirs(os.path.dirname(src), exist_ok=True)
+        os.rename(dst, src)
     elif kind == "trash":
         trash_restore(dst, src)
     elif kind == "tags":
@@ -343,6 +354,11 @@ class Plan:
     def trash(self, path):
         self.steps.append(dict(kind="trash", src=path, dst=None, size=0, extra={}))
 
+    def relocate(self, src, dst):
+        """Renames a folder inside the library (an artist folder to its right letter). Refuses
+        when something is already at the destination."""
+        self.steps.append(dict(kind="rename", src=src, dst=dst, size=0, extra={}))
+
     def set_tags(self, path, tags):
         self.steps.append(dict(kind="tags", src=path, dst=None, size=0, extra={"tags": tags}))
 
@@ -371,6 +387,8 @@ class Plan:
                 pass
             elif s["kind"] == "add_file":
                 lines.append(f"Add {s['dst']}")
+            elif s["kind"] == "rename":
+                lines.append(f"Move {s['src']}  →  {s['dst']}")
         tags = [s for s in self.steps if s["kind"] == "tags"]
         if tags:
             folders = sorted({os.path.dirname(s["src"]) for s in tags})
@@ -392,12 +410,14 @@ class Plan:
                 continue
             if not self.library_root:
                 raise SafetyError("No library set for this change")
-            targets = [s["dst"]] if s["kind"] in ("copy", "add_file") else [s["src"]]
+            targets = ([s["dst"]] if s["kind"] in ("copy", "add_file") else
+                       [s["src"], s["dst"]] if s["kind"] == "rename" else [s["src"]])
             for p in targets:
                 if not p or not _inside(p, self.library_root) or _inside(p, os.path.join(self.library_root, BIN_DIR)):
                     raise SafetyError(f"Refusing to change something outside the library: {p}")
         self.batch = journal.begin(self.title)
-        total = self.total_bytes() or 1
+        # every copied byte is written once and read back once to be checked
+        total = 2 * self.total_bytes() or 1
         done_bytes = [0]
         try:
             for seq, s in enumerate(self.steps):
@@ -405,16 +425,19 @@ class Plan:
                     raise InterruptedError("Stopped")
                 kind = s["kind"]
                 if kind == "copy":
-                    def tick(n, name=os.path.basename(s["src"])):
+                    def tick(n, name="Copying " + os.path.basename(s["src"])):
                         done_bytes[0] += n
                         if progress:
                             progress(done_bytes[0], total, name)
+
+                    def check(n, name="Checking " + os.path.basename(s["src"])):
+                        tick(n, name)
                     created = []
                     d = os.path.dirname(s["dst"])
                     while d and not os.path.isdir(d):
                         created.append(d)
                         d = os.path.dirname(d)
-                    digest = verified_copy(s["src"], s["dst"], tick)
+                    digest = verified_copy(s["src"], s["dst"], tick, check)
                     for folder in reversed(created):
                         journal.record(self.batch, seq, "mkdir", None, folder)
                     journal.record(self.batch, seq, "copy", s["src"], s["dst"],
@@ -425,6 +448,19 @@ class Plan:
                     os.rename(s["src"], target)
                     journal.record(self.batch, seq, "move", s["src"], target,
                                    {"stop_at": os.path.join(self.library_root, BIN_DIR)})
+                elif kind == "rename":
+                    if os.path.lexists(s["dst"]):
+                        raise SafetyError(f"Something is already at {s['dst']} — nothing was moved")
+                    created = []
+                    d = os.path.dirname(s["dst"])
+                    while d and not os.path.isdir(d):
+                        created.append(d)
+                        d = os.path.dirname(d)
+                    for folder in reversed(created):
+                        os.mkdir(folder)
+                        journal.record(self.batch, seq, "mkdir", None, folder)
+                    os.rename(s["src"], s["dst"])
+                    journal.record(self.batch, seq, "rename", s["src"], s["dst"])
                 elif kind == "trash":
                     dest = trash_put(s["src"])
                     journal.record(self.batch, seq, "trash", s["src"], dest)
