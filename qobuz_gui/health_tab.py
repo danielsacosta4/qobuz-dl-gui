@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from . import doctor, musicbrainz, navidrome, prefs
+from . import doctor, history, musicbrainz, navidrome, prefs, safeio
 from .client import run_async
 from .library_tab import library_folder
 
@@ -283,28 +283,59 @@ class HealthTab(QWidget):
             self.status(f"Queued {len(downloads)} download{'s' if len(downloads) != 1 else ''}.")
             return
         lib = library_folder()
+        if not history.ensure_library(self, lib):
+            return
 
-        def work():
-            from . import library
-            done, failed = [], []
+        def build():
+            """Builds one plan per fix (covers are downloaded first so the preview is exact)."""
+            import requests
+            from . import library as L
+            plans, problems = [], []
             for i in file_fixes:
                 try:
+                    if not i.folder:
+                        raise ValueError("couldn't find the album folder")
                     if i.kind == doctor.NO_COVER:
                         if not i.cover_url:
                             raise ValueError("Qobuz has no matching album to take a cover from")
-                        doctor.fix_cover(i)
+                        r = requests.get(i.cover_url, timeout=30)
+                        r.raise_for_status()
+                        plan = safeio.Plan(f"Add cover — {i.artist} — {i.album}", lib)
+                        plan.add_file(os.path.join(i.folder, "cover.jpg"), r.content)
                     elif i.kind == doctor.SPLIT:
-                        if not i.folder:
-                            raise ValueError("couldn't find the album folder")
-                        doctor.fix_album_artist(i.folder, i.extra.get("album_artist") or i.artist)
-                    elif i.kind == doctor.UNOFFICIAL:
-                        if not i.folder:
-                            raise ValueError("couldn't find the album folder")
-                        library.retire_copy(lib, i.folder)
-                    done.append(i)
+                        artist = i.extra.get("album_artist") or i.artist
+                        plan = safeio.Plan(f"One album artist ({artist}) — {i.album}", lib)
+                        for root, _, files in os.walk(i.folder):
+                            for f in sorted(files):
+                                if os.path.splitext(f)[1].lower() in L.AUDIO_EXT:
+                                    plan.set_tags(os.path.join(root, f), {"albumartist": [artist]})
+                    else:
+                        plan = safeio.Plan(f"Move unofficial release to bin — {i.artist} — {i.album}", lib)
+                        plan.retire(i.folder)
+                    plans.append((i, plan))
                 except Exception as e:
-                    failed.append((i, str(e)))
-            return done, failed
+                    problems.append((i, str(e)))
+            return plans, problems
+
+        def built(result):
+            plans, problems = result
+            if not plans:
+                self.status("Nothing could be fixed: " + "; ".join(f"{i.album} ({e})" for i, e in problems[:3]),
+                            error=True)
+                return
+            if not history.preview(self, "Fix library problems", [p for _, p in plans]):
+                return
+
+            def work():
+                done, failed = [], list(problems)
+                for i, plan in plans:
+                    try:
+                        plan.execute(history.journal())
+                        done.append(i)
+                    except Exception as e:
+                        failed.append((i, str(e)))
+                return done, failed
+            run_async(work, finished, lambda m: self.status(f"Fixing failed: {m}", error=True))
 
         def finished(result):
             done, failed = result
@@ -312,7 +343,7 @@ class HealthTab(QWidget):
             self.issues = [i for i in self.issues if id(i) not in fixed]
             doctor.save_results(self.issues, self.completion)
             self._fill_issues()
-            msg = f"Fixed {len(done)} problem{'s' if len(done) != 1 else ''}"
+            msg = f"Fixed {len(done)} problem{'s' if len(done) != 1 else ''} (undo from Library → History)"
             if downloads:
                 msg += f", queued {len(downloads)} download{'s' if len(downloads) != 1 else ''}"
             if failed:
@@ -322,7 +353,7 @@ class HealthTab(QWidget):
             if done:
                 self._rescan()
 
-        run_async(work, finished, lambda m: self.status(f"Fixing failed: {m}", error=True))
+        run_async(build, built, lambda m: self.status(f"Preparing fixes failed: {m}", error=True))
 
     def _rescan(self):
         if navidrome.configured() and prefs.get_bool(prefs.NAVIDROME_RESCAN, True):

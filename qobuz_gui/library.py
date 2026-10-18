@@ -311,6 +311,18 @@ def copy_album(src, dest, progress=None, should_stop=None):
     return done
 
 
+def remove_empty_parents(path, staging):
+    """After an album folder went to the Trash, removes the parent folders it left empty."""
+    staging = os.path.abspath(staging)
+    parent = os.path.dirname(os.path.abspath(path))
+    while parent.startswith(staging + os.sep):
+        try:
+            os.rmdir(parent)
+        except OSError:
+            break
+        parent = os.path.dirname(parent)
+
+
 def remove_staged(path, staging):
     """Deletes a sent album folder, then any parent folders it leaves empty (up to the staging root)."""
     shutil.rmtree(path)

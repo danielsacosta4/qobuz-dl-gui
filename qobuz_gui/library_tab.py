@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from . import config, library, prefs
+from . import config, history, library, prefs, safeio
 from .client import run_async
 from .download_tab import FolderPicker
 
@@ -45,7 +45,7 @@ class SendWorker(QThread):
 
     def __init__(self, jobs, staging, delete_after, library_root):
         super().__init__()
-        self.jobs = jobs                   # [(AlbumFolder, dest, [old copies to retire])]
+        self.jobs = jobs                   # [(AlbumFolder, safeio.Plan)]
         self.library_root = library_root
         self.staging = staging
         self.delete_after = delete_after
@@ -55,30 +55,30 @@ class SendWorker(QThread):
         self._stop = True
 
     def run(self):
-        total = sum(j[0].size for j in self.jobs) or 1
+        total = sum(plan.total_bytes() for _, plan in self.jobs) or 1
         before = 0
         sent = failed = 0
-        for album, dest, retire in self.jobs:
+        journal = history.journal()
+        for album, plan in self.jobs:
             if self._stop:
                 break
             try:
                 def cb(done, _tot, name, base=before):
                     self.progress.emit(int((base + done) * 100 / total), name)
-                library.copy_album(album.path, dest, progress=cb, should_stop=lambda: self._stop)
-                msg = "Sent"
-                for old in retire:
-                    library.retire_copy(self.library_root, old)
-                if retire:
-                    msg += f", replaced {len(retire)} old cop{'y' if len(retire) == 1 else 'ies'}"
-                if self.delete_after:
-                    library.remove_staged(album.path, self.staging)
-                    msg += " and removed from downloads"
+                plan.execute(journal, progress=cb, should_stop=lambda: self._stop)
+                retired = sum(1 for s in plan.steps if s["kind"] == "move" and s["extra"].get("why") == "replaced")
+                msg = "Sent (checksums verified)"
+                if retired:
+                    msg += f", replaced {retired} old cop{'y' if retired == 1 else 'ies'}"
+                if any(s["kind"] == "trash" for s in plan.steps):
+                    msg += ", download moved to Trash"
+                    library.remove_empty_parents(album.path, self.staging)
                 sent += 1
                 self.albumDone.emit(album.path, True, msg)
             except Exception as e:
                 failed += 1
                 self.albumDone.emit(album.path, False, str(e))
-            before += album.size
+            before += plan.total_bytes()
         self.allDone.emit(sent, failed)
 
 
@@ -128,6 +128,8 @@ class LibraryTab(QWidget):
         self.btn_all = QPushButton("Tick all ready")
         self.btn_none = QPushButton("Untick all")
         self.btn_open = QPushButton("Open download folder")
+        self.btn_history = QPushButton("History…")
+        self.btn_history.setToolTip("Every change the app made, with Undo")
         self.btn_bin = QPushButton("Empty replaced bin")
         self.btn_bin.setToolTip("Old copies replaced by better ones wait in a hidden folder in the library "
                                 "until you empty it")
@@ -145,6 +147,7 @@ class LibraryTab(QWidget):
         buttons.addWidget(self.btn_all)
         buttons.addWidget(self.btn_none)
         buttons.addWidget(self.btn_open)
+        buttons.addWidget(self.btn_history)
         buttons.addWidget(self.btn_bin)
         buttons.addWidget(self.summary, 1)
         buttons.addWidget(self.progress, 1)
@@ -162,6 +165,7 @@ class LibraryTab(QWidget):
         self.btn_none.clicked.connect(lambda: self._tick_all(False))
         self.btn_open.clicked.connect(self._open_staging)
         self.btn_bin.clicked.connect(self._empty_bin)
+        self.btn_history.clicked.connect(self.show_history)
         self.btn_send.clicked.connect(self.send)
         self.btn_stop.clicked.connect(self._stop)
         self.table.itemChanged.connect(self._item_changed)
@@ -297,9 +301,13 @@ class LibraryTab(QWidget):
         combo.currentIndexChanged.connect(changed)
         self.table.setCellWidget(row, C_ACTION, combo)
 
+    def show_history(self):
+        history.HistoryDialog(self, on_change=self.refresh).exec()
+
     def _empty_bin(self):
         lib = self.library_path()
-        if not os.path.isdir(lib):
+        if safeio.library_state(lib) != "ok":
+            history.ensure_library(self, lib)
             return
         count, size = library.trash_size(lib)
         if not count:
@@ -308,11 +316,18 @@ class LibraryTab(QWidget):
         if QMessageBox.question(
                 self, "Empty replaced bin",
                 f"Permanently delete {count} replaced album{'s' if count != 1 else ''} "
-                f"({human_size(size)}) from {os.path.join(lib, library.TRASH_DIR)}?") != QMessageBox.Yes:
+                f"({human_size(size)}) from {os.path.join(lib, library.TRASH_DIR)}?\n\n"
+                "This is the one step that can't be undone.") != QMessageBox.Yes:
             return
+        j = history.journal()
+        batch = j.begin(f"Empty replaced bin ({count} albums)")
         try:
+            j.record(batch, 0, "purge", os.path.join(lib, library.TRASH_DIR), None,
+                     {"albums": count, "bytes": size})
             library.empty_trash(lib)
+            j.finish(batch, "done", "permanent — can't be undone")
         except OSError as e:
+            j.finish(batch, "failed", str(e))
             QMessageBox.warning(self, "Replaced bin", str(e))
             return
         self.status(f"Deleted {count} replaced album{'s' if count != 1 else ''}.")
@@ -338,9 +353,7 @@ class LibraryTab(QWidget):
     # ---- sending -------------------------------------------------------------
     def send(self):
         lib = self.library_path()
-        if not os.path.isdir(lib):
-            QMessageBox.warning(self, "Library", f"The library folder isn't available:\n{lib}\n\n"
-                                "Check that the TrueNAS share is mounted.")
+        if not history.ensure_library(self, lib):
             return
         jobs = []
         for r, album in enumerate(self.albums):
@@ -354,23 +367,22 @@ class LibraryTab(QWidget):
         if not jobs:
             self.status("Tick at least one album to send (rows set to \"Don't send\" are left out).")
             return
-        merges = sum(1 for a, d, _ in jobs if os.path.isdir(d))
-        replaced = [p for _, _, ret in jobs for p in ret]
-        size = sum(a.size for a, _, _ in jobs)
-        text = f"Copy {len(jobs)} album{'s' if len(jobs) != 1 else ''} ({human_size(size)}) to {lib}?"
-        if replaced:
-            listing = "\n".join(f"• {os.path.relpath(p, lib)}" for p in replaced[:8])
-            more = f"\n… and {len(replaced) - 8} more" if len(replaced) > 8 else ""
-            text += (f"\n\nThese older copies will be moved to the hidden replaced bin "
-                     f"(empty it later from this tab):\n{listing}{more}")
-        if merges:
-            text += f"\n\n{merges} already exist under the same name; files with the same name will be replaced."
-        if self.delete_after.isChecked():
-            text += "\n\nEach album is removed from the download folder once its copy is verified."
-        if QMessageBox.question(self, "Send to library", text) != QMessageBox.Yes:
+        plans = []
+        for album, dest, retire in jobs:
+            plan = safeio.Plan(f"Send {album.artist} — {library.clean_album_name(album.name)}", lib)
+            plan.copy_tree(album.path, dest)
+            for old in retire:
+                plan.retire(old)
+            if self.delete_after.isChecked():
+                plan.trash(album.path)
+            plans.append((album, plan))
+        if not history.preview(self, "Send to library", [p for _, p in plans],
+                               footer="Each file is read back from the share and compared (SHA-256) before the "
+                                      "next step. Replaced files go to the hidden bin, downloads to the desktop "
+                                      "Trash — both can be undone from History."):
             return
 
-        self.worker = SendWorker(jobs, staging_folder(), self.delete_after.isChecked(), lib)
+        self.worker = SendWorker(plans, staging_folder(), self.delete_after.isChecked(), lib)
         self.worker.progress.connect(self._progress)
         self.worker.albumDone.connect(self._album_done)
         self.worker.allDone.connect(self._all_done)
