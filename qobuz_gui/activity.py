@@ -1,13 +1,31 @@
-"""The bottom panel: job queue, live log, progress bar, stop button and answer box."""
+"""The bottom panel: job queue, live log, progress bars, stop button and answer box."""
+
+import time
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFontDatabase, QTextCursor
+from PySide6.QtGui import QFontDatabase, QKeySequence, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
     QProgressBar, QPushButton, QSplitter, QTextEdit, QVBoxLayout, QWidget,
 )
 
 STATUS_ICON = {"queued": "⏳", "running": "▶", "done": "✔", "failed": "✖", "stopped": "■"}
+FINISHED = ("done", "failed", "stopped")
+
+
+def _clock(seconds):
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _about(seconds):
+    if seconds < 90:
+        return "about a minute"
+    if seconds < 3600:
+        return f"about {round(seconds / 60)} min"
+    return f"about {seconds / 3600:.1f} h"
 
 
 class ActivityPanel(QWidget):
@@ -15,6 +33,10 @@ class ActivityPanel(QWidget):
         super().__init__(parent)
         self.runner = runner
         self.items = {}
+        self.batch = []            # ids of the jobs added since the queue was last empty
+        self.started = {}          # job id -> time it started running
+        self.took = {}             # job id -> seconds it ran
+        self._percent = 0
 
         # Queue
         self.queue = QListWidget()
@@ -48,6 +70,13 @@ class ActivityPanel(QWidget):
         self.progress.setTextVisible(True)
         self.progress.setFormat("Idle")
         self.progress.setValue(0)
+        self.overall = QProgressBar()
+        self.overall.setRange(0, 1000)
+        self.overall.setTextVisible(True)
+        self.overall.setMinimumWidth(260)
+        self.overall.setMaximumWidth(360)
+        self.overall.setVisible(False)
+        self.overall.setToolTip("The whole queue. The time left is a guess from how long the finished jobs took.")
 
         self.btn_stop = QPushButton("Stop")
         self.btn_stop.setToolTip("Stop the running job (partial files are cleaned up)")
@@ -63,6 +92,7 @@ class ActivityPanel(QWidget):
 
         top = QHBoxLayout()
         top.addWidget(self.progress, 1)
+        top.addWidget(self.overall)
         top.addWidget(self.btn_stop)
         top.addWidget(self.btn_stop_all)
         bottom = QHBoxLayout()
@@ -102,9 +132,16 @@ class ActivityPanel(QWidget):
         self.answer.returnPressed.connect(self._send_answer)
         self.btn_copy.clicked.connect(self._copy_log)
         self.btn_clear_log.clicked.connect(self.log.clear)
+        stop_key = QShortcut(QKeySequence(Qt.Key_Escape), self)
+        stop_key.setContext(Qt.WidgetWithChildrenShortcut)
+        stop_key.activated.connect(runner.stop)
 
     # ---- queue ---------------------------------------------------------------
     def _job_added(self, job):
+        if all(self.items.get(i, (None, None))[1] is None or self.items[i][1].status in FINISHED
+               for i in self.batch):
+            self.batch = []
+        self.batch.append(job.id)
         item = QListWidgetItem()
         item.setData(Qt.UserRole, job.id)
         item.setToolTip("qobuz-dl " + " ".join(job.args))
@@ -113,7 +150,13 @@ class ActivityPanel(QWidget):
         self._render(job)
 
     def _job_changed(self, job):
+        if job.status == "running":
+            self.started[job.id] = time.monotonic()
+            self._percent = 0
+        elif job.status in FINISHED and job.id in self.started and job.id not in self.took:
+            self.took[job.id] = time.monotonic() - self.started[job.id]
         self._render(job)
+        self._render_overall()
         running = self.runner.busy()
         self.btn_stop.setEnabled(running)
         self.btn_stop_all.setEnabled(running or bool(self.runner.pending()))
@@ -122,7 +165,27 @@ class ActivityPanel(QWidget):
     def _render(self, job):
         entry = self.items.get(job.id)
         if entry:
-            entry[0].setText(f"{STATUS_ICON.get(job.status, '')}  {job.title}")
+            took = self.took.get(job.id)
+            suffix = f"   · {_clock(took)}" if took is not None and job.status != "stopped" else ""
+            entry[0].setText(f"{STATUS_ICON.get(job.status, '')}  {job.title}{suffix}")
+
+    def _render_overall(self):
+        jobs = [self.items[i][1] for i in self.batch if i in self.items]
+        n = len(jobs)
+        finished = sum(1 for j in jobs if j.status in FINISHED)
+        if n < 2 or finished == n:
+            self.overall.setVisible(False)
+            return
+        self.overall.setVisible(True)
+        running = any(j.status == "running" for j in jobs)
+        value = (finished + (self._percent / 100 if running else 0)) / n
+        self.overall.setValue(int(value * 1000))
+        text = f"Job {min(finished + 1, n)} of {n}"
+        times = [self.took[j.id] for j in jobs if j.status == "done" and j.id in self.took]
+        if times:
+            left = (sum(times) / len(times)) * (n - finished - (self._percent / 100 if running else 0))
+            text += f" · {_about(left)} left"
+        self.overall.setFormat(text)
 
     def _remove_selected(self):
         item = self.queue.currentItem()
@@ -151,12 +214,15 @@ class ActivityPanel(QWidget):
     def _line(self, html_text, _plain):
         bar = self.log.verticalScrollBar()
         at_bottom = bar.value() >= bar.maximum() - 4
-        self.log.append(html_text or "&nbsp;")
+        self.log.append(html_text or "")   # "" = an empty line ("&nbsp;" alone was shown literally)
         if at_bottom:
             self.log.moveCursor(QTextCursor.End)
             bar.setValue(bar.maximum())
 
     def _progress(self, percent, label):
+        self._percent = percent
+        if self.overall.isVisible():
+            self._render_overall()
         self.progress.setValue(percent)
         self.progress.setFormat(f"{label}  —  %p%" if label else "%p%")
 

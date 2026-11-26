@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QLabel, QLineEdit, QMessageBox, QVBoxLayout,
 )
 
-from . import config
+from . import config, theme
 from .client import run_async
 from .download_tab import FolderPicker, quality_combo, set_quality
 from .settings_tab import PasswordField
@@ -86,6 +86,6 @@ class SetupDialog(QDialog):
 
         def fail(msg):
             self.buttons.setEnabled(True)
-            self.state.setText(f"<span style='color:#e5534b'>Setup failed: {msg}</span>")
+            self.state.setText(f"<span style='color:{theme.ERROR}'>Setup failed: {msg}</span>")
 
         run_async(lambda: config.create_with_wizard(**args), ok, fail)

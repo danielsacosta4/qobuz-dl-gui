@@ -10,7 +10,9 @@ from dataclasses import dataclass, field
 
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signal
 
+from . import theme
 from .logparse import OutputParser
+from .qobuz_guard import guard, looks_blocked
 
 PACKAGE_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -39,6 +41,7 @@ class JobRunner(QObject):
     progressIdle = Signal()
     prompt = Signal(object, str)       # job, prompt text
     authProblem = Signal(str)
+    blocked = Signal(str)              # Qobuz says the account is blocked: everything is stopped
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -127,6 +130,10 @@ class JobRunner(QObject):
                     self.current.saw_success = True
                 if "401 Unauthorized" in text or "Auth Token missing" in text:
                     self.authProblem.emit(text.strip())
+                if looks_blocked(text):
+                    guard.trip("Qobuz says this account is blocked (USER_BLOCKED).")
+                    self.stop_all()
+                    self.blocked.emit(text.strip())
                 self.line.emit(html_text, text)
             elif ev[0] == "progress":
                 self.progress.emit(ev[1], ev[2])
@@ -164,7 +171,7 @@ class JobRunner(QObject):
 
     def _error(self, err):
         if err == QProcess.FailedToStart and self.current:
-            self.line.emit('<span style="color:#e5534b">Could not start Python to run qobuz-dl.</span>',
+            self.line.emit(f'<span style="color:{theme.ERROR}">Could not start Python to run qobuz-dl.</span>',
                            "Could not start Python to run qobuz-dl.")
 
     def _finished(self, code, _status):
@@ -176,7 +183,7 @@ class JobRunner(QObject):
             ok = code == 0 or (job.success_text and job.saw_success)
             job.status = "done" if ok else "failed"
         mark = {"done": "✔ Finished", "failed": f"✖ Failed (exit code {code})", "stopped": "■ Stopped"}[job.status]
-        colour = {"done": "#3fa65a", "failed": "#e5534b", "stopped": "#c99a2e"}[job.status]
+        colour = {"done": theme.OK, "failed": theme.ERROR, "stopped": theme.WARN}[job.status]
         self.line.emit(f'<b style="color:{colour}">{mark}: {html.escape(job.title)}</b>', f"{mark}: {job.title}")
         self.line.emit("", "")
         self.progressIdle.emit()

@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QPushButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
 )
 
-from . import config, navidrome, prefs
+from . import automation, config, navidrome, prefs, theme, wikipedia
 from .client import run_async
 from .download_tab import FolderPicker, quality_combo, set_quality
 
@@ -83,6 +83,7 @@ class PasswordField(QWidget):
 
 class SettingsTab(QWidget):
     saved = Signal()
+    runAutomationNow = Signal()
 
     def __init__(self, session, status, parent=None):
         super().__init__(parent)
@@ -196,6 +197,92 @@ class SettingsTab(QWidget):
         app_box = QGroupBox("App")
         app_box.setLayout(app_lay)
 
+        # Studio albums: Qobuz or Wikipedia (stored by the GUI)
+        self.studio_default = QComboBox()
+        self.studio_default.addItem("Qobuz (release types + MusicBrainz)", "qobuz")
+        self.studio_default.addItem("Wikipedia (the artist's discography page)", "wikipedia")
+        self.wiki_lang = QComboBox()
+        for code, label in wikipedia.LANGUAGES:
+            self.wiki_lang.addItem(label, code)
+        studio_help = QLabel("Decides what counts as a studio album in Complete my artists, in Search (the “N of M "
+                             "studio albums” count and the Studio album filter) and for Discover's latest album. "
+                             "You can override it for one artist with the Compare button in either tab. "
+                             "Wikipedia lists have no downloads of their own: an album Qobuz doesn't have is shown "
+                             "but can't be downloaded.")
+        studio_help.setWordWrap(True)
+        studio_help.setEnabled(False)
+        st = QFormLayout()
+        st.addRow("Studio albums come from", self.studio_default)
+        st.addRow("Wikipedia language", self.wiki_lang)
+        st.addRow("", studio_help)
+        studio_box = QGroupBox("Studio albums")
+        studio_box.setLayout(st)
+
+        # Qobuz contact (stored by the GUI)
+        self.qobuz_budget = QSpinBox()
+        self.qobuz_budget.setRange(0, 1000)
+        self.qobuz_budget.setSpecialValueText("0 — none")
+        self.qobuz_budget.setSuffix(" a day")
+        qb_help = QLabel(
+            "<b>When does this app contact Qobuz?</b> Only when you act: searching, opening an artist, selecting "
+            "an album, downloading, “Download latest album” in Discover, Download on a missing album, and Load "
+            "Qobuz data in Compare. Scans, Discover, Complete my artists and the background check never do.<br>"
+            "The setting above is the only exception: Library health → Check on Qobuz asks about artists you "
+            "choose, up to this many requests per day (0 switches it off). If Qobuz says the account is blocked or "
+            "rate-limited, the app stops every Qobuz request until you press “I've been unblocked”.")
+        qb_help.setWordWrap(True)
+        qb_help.setTextFormat(Qt.RichText)
+        qb_help.setEnabled(False)
+        self.safe_mode = QCheckBox("Safe mode (recommended, especially after a Qobuz block)")
+        self.safe_mode.setToolTip(
+            "Keeps Qobuz traffic to the bare minimum:\n"
+            "• the Discover tab is hidden\n"
+            "• Check on Qobuz and Load Qobuz data are off\n"
+            "• requests are spaced 3 seconds apart (1 second otherwise)\n"
+            "• album details load only when you press the button\n"
+            "• Qobuz link look-ups are limited to 5 per click\n"
+            "• downloads run one at a time with a 2-second delay between tracks")
+        self.safe_mode.toggled.connect(lambda on: self.qobuz_budget.setEnabled(not on))
+        qb = QFormLayout()
+        qb.addRow("", self.safe_mode)
+        qb.addRow("Background Qobuz requests", self.qobuz_budget)
+        qb.addRow("", qb_help)
+        qobuz_box = QGroupBox("Qobuz contact")
+        qobuz_box.setLayout(qb)
+
+        # Automation (stored by the GUI)
+        self.auto_hours = QComboBox()
+        for hours, label in automation.INTERVALS:
+            self.auto_hours.addItem(label, hours)
+        self.auto_send = QCheckBox("Send finished downloads to the library by themselves")
+        self.auto_send.setToolTip("Only albums that are new to the library: anything that would replace, merge "
+                                  "with or sit next to another copy waits for you in the Library tab. Same "
+                                  "checksums and History (Undo) as sending by hand, without the preview.")
+        self.auto_location = QCheckBox("Move artist folders to the right letter (R4)")
+        self.auto_location.setToolTip("Refuses when a folder with that name is already at the right letter.")
+        self.btn_auto_now = QPushButton("Run the check now")
+        auto_fix = QHBoxLayout()
+        auto_fix.addWidget(self.auto_location)
+        auto_fix.addStretch(1)
+        auto_run = QHBoxLayout()
+        auto_run.addWidget(self.auto_hours)
+        auto_run.addWidget(self.btn_auto_now)
+        auto_run.addStretch(1)
+        auto_help = QLabel("The background check runs while the app is open or in the tray. It scans your own library "
+                           "through Navidrome and your folders (and reads Wikipedia's lists); it never contacts "
+                           "Qobuz and never downloads anything. Everything it changes is recorded in Library → "
+                           "History and can be undone; duplicates and split albums are always left for you.")
+        auto_help.setWordWrap(True)
+        auto_help.setEnabled(False)
+        auto = QFormLayout()
+        auto.addRow("After downloads", self.auto_send)
+        auto.addRow("Background check", auto_run)
+        auto.addRow("Safe fixes", auto_fix)
+        auto.addRow("", auto_help)
+        auto_box = QGroupBox("Automation")
+        auto_box.setLayout(auto)
+        self.btn_auto_now.clicked.connect(self._run_auto_now)
+
         # Navidrome
         self.nd_url = QLineEdit()
         self.nd_url.setPlaceholderText("https://navidrome.example.com")
@@ -236,7 +323,7 @@ class SettingsTab(QWidget):
 
         body = QWidget()
         bl = QVBoxLayout(body)
-        for w in (acc_box, nd_box, dl_box, names_box, lib_box, tag_box, app_box):
+        for w in (acc_box, nd_box, dl_box, names_box, lib_box, tag_box, app_box, studio_box, qobuz_box, auto_box):
             bl.addWidget(w)
         bl.addStretch(1)
         scroll = QScrollArea()
@@ -286,6 +373,28 @@ class SettingsTab(QWidget):
         self._loaded_nd_password = navidrome.load_password()
         self.nd_password.setText(self._loaded_nd_password)
         self.nd_rescan.setChecked(prefs.get_bool(prefs.NAVIDROME_RESCAN, True))
+        self.studio_default.setCurrentIndex(max(0, self.studio_default.findData(
+            prefs.get_str(prefs.STUDIO_DEFAULT, "qobuz"))))
+        self.wiki_lang.setCurrentIndex(max(0, self.wiki_lang.findData(prefs.get_str(prefs.WIKI_LANG, "en"))))
+        hours = prefs.get_int(prefs.AUTO_HOURS, 0)
+        self.auto_hours.setCurrentIndex(max(0, self.auto_hours.findData(hours)))
+        for cb, key in self._auto_boxes():
+            cb.setChecked(prefs.get_bool(key, False))
+        self.qobuz_budget.setValue(prefs.get_int(prefs.QOBUZ_BUDGET, 0))
+        self.safe_mode.setChecked(prefs.safe_mode())
+        self.qobuz_budget.setEnabled(not self.safe_mode.isChecked())
+
+    def _auto_boxes(self):
+        return [(self.auto_send, prefs.AUTO_SEND), (self.auto_location, prefs.AUTO_FIX_LOCATION)]
+
+    def _save_automation(self):
+        prefs.set_value(prefs.AUTO_HOURS, int(self.auto_hours.currentData() or 0))
+        for cb, key in self._auto_boxes():
+            prefs.set_value(key, cb.isChecked())
+
+    def _run_auto_now(self):
+        self._save_automation()     # run with what is ticked now
+        self.runAutomationNow.emit()
 
     def save(self):
         formats = {key: self.formats[key].text().strip() for key, _, _ in FORMAT_FIELDS}
@@ -329,6 +438,11 @@ class SettingsTab(QWidget):
         prefs.set_value(prefs.NAVIDROME_URL, self.nd_url.text().strip().rstrip("/"))
         prefs.set_value(prefs.NAVIDROME_USER, self.nd_user.text().strip())
         prefs.set_value(prefs.NAVIDROME_RESCAN, self.nd_rescan.isChecked())
+        self._save_automation()
+        prefs.set_value(prefs.QOBUZ_BUDGET, self.qobuz_budget.value())
+        prefs.set_value(prefs.SAFE_MODE, self.safe_mode.isChecked())
+        prefs.set_value(prefs.STUDIO_DEFAULT, self.studio_default.currentData())
+        prefs.set_value(prefs.WIKI_LANG, self.wiki_lang.currentData())
         if self.nd_password.text() != getattr(self, "_loaded_nd_password", ""):
             notes.append(navidrome.store_password(self.nd_password.text()))
             self._loaded_nd_password = self.nd_password.text()
@@ -379,12 +493,12 @@ class SettingsTab(QWidget):
             version, albums, admin = result
             self.btn_nd_test.setEnabled(True)
             note = "" if admin else " — not an admin account, so rescans won't work"
-            self.nd_state.setText(f"<span style='color:#3fa65a'>✔ Connected to Navidrome {version} · "
+            self.nd_state.setText(f"<span style='color:{theme.OK}'>✔ Connected to Navidrome {version} · "
                                   f"{albums} albums</span>{note}")
 
         def fail(msg):
             self.btn_nd_test.setEnabled(True)
-            self.nd_state.setText(f"<span style='color:#e5534b'>✖ {msg}</span>")
+            self.nd_state.setText(f"<span style='color:{theme.ERROR}'>✖ {msg}</span>")
         run_async(work, ok, fail)
 
     def test_login(self):
@@ -396,12 +510,12 @@ class SettingsTab(QWidget):
 
         def ok(_client):
             self.btn_test.setEnabled(True)
-            self.login_state.setText(f"<span style='color:#3fa65a'>✔ Logged in — {self.session.label or 'OK'}</span>")
+            self.login_state.setText(f"<span style='color:{theme.OK}'>✔ Logged in — {self.session.label or 'OK'}</span>")
             self.status(f"Logged in to Qobuz ({self.session.label})")
 
         def fail(msg):
             self.btn_test.setEnabled(True)
-            self.login_state.setText(f"<span style='color:#e5534b'>✖ {msg}</span>")
+            self.login_state.setText(f"<span style='color:{theme.ERROR}'>✖ {msg}</span>")
 
         run_async(self.session.client, ok, fail)
 
@@ -422,6 +536,6 @@ class SettingsTab(QWidget):
 
         def fail(msg):
             self.btn_appid.setEnabled(True)
-            self.login_state.setText(f"<span style='color:#e5534b'>✖ Could not fetch the app ID: {msg}</span>")
+            self.login_state.setText(f"<span style='color:{theme.ERROR}'>✖ Could not fetch the app ID: {msg}</span>")
 
         run_async(work, ok, fail)

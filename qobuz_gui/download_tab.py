@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
-from . import config, prefs
+from . import config, prefs, qobuz_guard
 from .jobs import Job
 
 URL_RE = re.compile(r"https?://\S+")
@@ -332,10 +332,13 @@ class DownloadTab(QWidget):
             (self.with_credits, "--with-credits"),
         ]
         args += [flag for box, flag in flags if box.isChecked()]
-        if self.delay.value():
-            args += ["--delay", str(self.delay.value())]
-        if self.workers.value():
-            args += ["--max-workers", str(self.workers.value())]
+        safe = prefs.safe_mode()
+        delay = max(self.delay.value(), prefs.SAFE_DELAY) if safe else self.delay.value()
+        workers = 1 if safe else self.workers.value()
+        if delay:
+            args += ["--delay", str(delay)]
+        if workers:
+            args += ["--max-workers", str(workers)]
         if self.blacklist.text():
             args += ["-b", os.path.expanduser(self.blacklist.text())]
         if self.label_filter.text().strip():
@@ -350,6 +353,11 @@ class DownloadTab(QWidget):
 
     def enqueue(self, sources, title=None):
         """Queues one `dl` job per source so each shows up (and can fail) on its own."""
+        paused = qobuz_guard.guard.blocked_message()
+        if paused and QMessageBox.question(
+                self, "Qobuz is paused", paused + "\n\nQueue the download anyway? Asking Qobuz while it is "
+                "blocking the account can make the block last longer.", defaultButton=QMessageBox.No) != QMessageBox.Yes:
+            return []
         if any("/artist/" in s for s in sources) and not any(cb.isChecked() for cb in self.types.values()):
             QMessageBox.information(self, "No release types", "Tick at least one release type for artist links.")
             return []

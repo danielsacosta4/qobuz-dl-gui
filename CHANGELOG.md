@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.10.1 — beta (2026-11-15)
+
+- **Safe mode, on by default** (Settings → Qobuz contact), to keep Qobuz traffic to the minimum. While it's on:
+  the Discover tab is hidden; *Check on Qobuz* and *Load Qobuz data* are off; Qobuz requests are spaced 3 seconds
+  apart; the album details panel loads only when you press *Load details*; Qobuz link look-ups are limited to 5
+  per click; downloads run one at a time with at least 2 seconds between tracks. The status bar shows "Safe mode".
+
+## 0.10.0 — beta (2026-11-07)
+
+Much less contact with Qobuz, after Qobuz blocked the account:
+- **Qobuz is only contacted when you act.** The Library doctor scan, the Library report, Complete my artists,
+  Discover and the background check make no Qobuz request.
+- **Complete my artists** compares your library with **Wikipedia's** studio-album lists. A missing album's Qobuz
+  link is looked up when you click Download. **Check on Qobuz…** runs the Qobuz-based checks (Hi-Res / explicit
+  available, missing tracks, covers) for the artists you select, within a daily limit (0 by default = off).
+- **Discover** reads similar artists from your **Navidrome** server (Last.fm) instead of Qobuz. The Qobuz
+  similar-artist and featured-album calls, and the Qobuz featured lists, are gone.
+- **Automation trimmed** to what is local: send finished downloads, the background library check, wrong-letter
+  folder moves. New-release downloads, favourites downloads, the weekly pick and automatic covers were removed.
+- **Hard stop**: if Qobuz answers "account blocked" (`USER_BLOCKED`), 403 or 429, the app stops every Qobuz
+  request, shows "Qobuz paused", asks before queueing a download and remembers it across restarts until you press
+  *I've been unblocked*.
+- Compare no longer asks Qobuz by itself (*Load Qobuz data* does, when pressed).
+
+## 0.9.9 — beta (2026-10-28)
+
+- The **Studio albums: Qobuz | Wikipedia** box and **Compare…** also appear on ordinary album searches. They are
+  about the artist with the most results in the list; at most 5 artists per list are looked up on Wikipedia.
+
+## 0.9.8 — beta (2026-10-28)
+
+- **Studio albums from Qobuz or Wikipedia**, per artist or for everyone (Settings → Studio albums), with a
+  side-by-side Compare view. Used by Complete my artists, Search artist pages and Discover. Wikipedia language:
+  English, Portuguese, Spanish, French or German.
+
+## 0.9.7 — beta (2026-10-28)
+
+- New **Discover** tab: artists you don't have, similar to the ones you own, with Dismiss. (It first used Qobuz's
+  similar-artist data; 0.10.0 moved it to Navidrome.)
+
+## 0.9.6 — beta (2026-10-21)
+
+- **Faster**: a finished download re-reads only the download history, not the whole library; the Library tab scans
+  the download folder in the background and skips it when nothing changed; album details and covers are kept on
+  disk.
+- **Keyboard shortcuts** (list in Library tools), and **paste or drop links** anywhere to queue them.
+- **Send to library by itself** (opt-in): albums new to the library go without the preview, with the same
+  checksums and History.
+- **Background check** (opt-in) every 6, 12 or 24 hours.
+- Status colours follow a light or dark theme; the queue shows an overall bar with a time estimate and how long
+  each job took; album details show whether you own the album and each track's quality.
+
 ## 0.9.5 — beta (2026-10-18)
 
 The library rules (see RULES.md):

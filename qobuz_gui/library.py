@@ -28,6 +28,8 @@ class AlbumFolder:
     others: list = field(default_factory=list)   # [(path, quality)] other copies in the library
     quality: tuple = ()
     action: str = "replace"                      # replace, keep, skip  (when others exist)
+    dest_status: str = None                      # worked out by resolve(), in a worker thread
+    dest_lib: str = None
 
 
 def _is_audio(name):
@@ -226,6 +228,40 @@ def destination(library, album):
     return dest, status
 
 
+def resolve(library_root, album):
+    """Works out where an album goes and what is already there (reads the share: run off the GUI thread)."""
+    album.dest, album.dest_status = destination(library_root, album)
+    album.dest_lib = library_root
+    if album.others:
+        album.action = default_action(album)
+    return album
+
+
+def resolve_all(library_root, albums):
+    if not library_root or not os.path.isdir(library_root):
+        return albums
+    for a in albums:
+        if a.kind == "album" and a.state != "in_progress":
+            try:
+                resolve(library_root, a)
+            except OSError:
+                a.dest_status = None
+    return albums
+
+
+def tree_signature(root):
+    """Cheap fingerprint of a folder tree (folder paths and modification times), to skip
+    re-reading tags when nothing was added or removed."""
+    sig = []
+    for dp, dirs, _files in os.walk(root):
+        dirs.sort()
+        try:
+            sig.append((dp, os.stat(dp).st_mtime_ns))
+        except OSError:
+            pass
+    return tuple(sig)
+
+
 def default_action(album):
     """What to do when another copy exists: replace if the new one is at least as good."""
     if not album.others:
@@ -386,16 +422,18 @@ class LibraryIndex:
                 key = _norm(artist)
                 if key:
                     idx.artists.setdefault(key, []).extend(forms)
-        idx._load_history(db_path)
+        idx.refresh_history(db_path)
         return idx
 
-    def _load_history(self, db_path):
+    def refresh_history(self, db_path):
+        """Re-reads qobuz-dl's download history only (cheap; the library part is unchanged)."""
         if db_path and os.path.isfile(db_path):
             try:
                 with sqlite3.connect(db_path) as conn:
                     self.history = {str(r[0]) for r in conn.execute("SELECT id FROM downloads")}
             except sqlite3.Error:
                 pass
+        return self
 
     @classmethod
     def build(cls, library, db_path):
@@ -416,13 +454,7 @@ class LibraryIndex:
                     except OSError:
                         continue
                     idx.artists.setdefault(_norm(artist), []).extend(albums)
-        if db_path and os.path.isfile(db_path):
-            try:
-                with sqlite3.connect(db_path) as conn:
-                    idx.history = {str(r[0]) for r in conn.execute("SELECT id FROM downloads")}
-            except sqlite3.Error:
-                pass
-        return idx
+        return idx.refresh_history(db_path)
 
     def status(self, item_id, artist, title):
         """'library', 'history' or '' for an album."""

@@ -13,6 +13,12 @@ Anything you decide is fine as it is can be marked as an **exception** — it no
 | R4 | Location | Every album is filed as `Letter/Artist/Album`. | Doctor · report `location.csv` |
 | R5 | One album in Navidrome | Navidrome shows each album once, under one album artist. | Doctor · report `split.csv` |
 
+> **Qobuz and these checks.** R1, R4 and R5 (and missing covers) are measured from your own library and need no
+> Qobuz request. R2 (best quality) and R3 (explicit) compare your albums with Qobuz's catalogue, so they are only
+> checked for the artists you pick with *Check on Qobuz* (Library health → Complete my artists), within the daily
+> limit in Settings → Qobuz contact, and not at all while Safe mode is on. The app never asks Qobuz about your whole
+> library in the background.
+
 ## What counts as "the same album"
 
 - **Editions are the same album**: deluxe, remastered, expanded, anniversary, bonus tracks, a year in brackets

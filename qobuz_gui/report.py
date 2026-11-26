@@ -6,7 +6,7 @@ Run it from the app (Library health → Library report) or from a terminal:
 
 It writes a folder with:
   report.md / report.json   the numbers (what's measured and how is written in report.md)
-  unmatched.csv             your albums the app couldn't find on Qobuz (or couldn't match)
+  unmatched.csv             your albums not found in the Qobuz data already saved here (or not matched)
   not_recognised.csv        albums matched on Qobuz but NOT recognised as owned (the ✔ would be missing)
   duplicates.csv            R1: albums present more than once (editions = same album, languages = different)
   upgrades.csv              R2: CD quality or lower with a Hi-Res version on Qobuz
@@ -16,7 +16,8 @@ It writes a folder with:
   spot_check.csv            30 random "owned" matches to check by eye (precision)
   testdata/                 the raw data used, for building tests — stays on your computer
 
-Nothing in the library is changed.
+Nothing in the library is changed, and no request is made to Qobuz: the report only uses Qobuz data that
+earlier searches already saved on this computer.
 """
 
 import csv
@@ -98,6 +99,19 @@ def check_location(root):
 
 
 # ---- main --------------------------------------------------------------------------
+class _NoQobuz:
+    """The report makes no Qobuz requests: any attempt is an error, not a quiet request."""
+
+    def __getattr__(self, name):
+        raise RuntimeError(f"the library report must not contact Qobuz (session.{name})")
+
+
+NO_QOBUZ_NOTE = ("This report made **no Qobuz requests**. The figures that compare your albums with Qobuz "
+                 "(matched on Qobuz, recognised as owned, Hi-Res or explicit available) use only the Qobuz data "
+                 "already saved on this computer by earlier searches, so artists you never looked up count as "
+                 "“not found”. The folder, duplicate and split-album figures come from your own library.")
+
+
 def run(out_dir=None):
     started = time.time()
     stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
@@ -110,7 +124,6 @@ def run(out_dir=None):
         _say("Navidrome isn't set up (Settings → Navidrome). The report needs it.")
         return 2
 
-    from .client import Session
     from .library import LibraryIndex
     from . import config
 
@@ -120,8 +133,7 @@ def run(out_dir=None):
     _say(f"  {len(albums)} albums")
     index = LibraryIndex.from_navidrome(albums, config.QOBUZ_DB)
 
-    session = Session()
-    scanner = doctor.Scanner(session, library_folder(), use_musicbrainz=False,
+    scanner = doctor.Scanner(_NoQobuz(), library_folder(), use_musicbrainz=False,
                              prefer_explicit=prefs.get_bool(prefs.PREFER_EXPLICIT, True))
 
     by_artist = {}
@@ -144,9 +156,9 @@ def run(out_dir=None):
         qobuz_lists = []
         for nm in names:
             try:
-                got = scanner.qobuz_discography(nm)
+                got = doctor.cached_discography([nm])      # only what is already saved here: no request
             except Exception as e:
-                _say(f"    Qobuz lookup failed for {nm}: {e}")
+                _say(f"    couldn't read the saved Qobuz data for {nm}: {e}")
                 got = []
             discographies[nm] = got
             qobuz_lists.append(got)
@@ -279,6 +291,8 @@ def _write_markdown(out_dir, n):
         "",
         f"App version {n['app_version']} · {n['albums_in_navidrome']} albums by {n['artists_in_navidrome']} "
         f"artists in Navidrome · took {n['minutes']} min",
+        "",
+        NO_QOBUZ_NOTE,
         "",
         "## Recognised as owned",
         "",

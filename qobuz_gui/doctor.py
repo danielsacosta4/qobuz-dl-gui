@@ -11,7 +11,8 @@ import re
 import time
 from dataclasses import asdict, dataclass, field
 
-from . import cache, classify, library, matching, musicbrainz, navidrome, rules
+from . import cache, classify, library, matching, musicbrainz, navidrome, rules, studio as studio_mod, wikipedia
+from .qobuz_guard import QobuzBlocked
 
 QOBUZ_TTL = 7 * cache.DAY
 QOBUZ_GAP = 0.6          # seconds between Qobuz API calls
@@ -74,7 +75,13 @@ class ArtistCompletion:
     owned: int
     total: int
     missing: list                 # [{title, year, url, explicit, quality}]
-    verified: bool                # counted against MusicBrainz's official list
+    verified: bool                # counted against MusicBrainz's official list (or Wikipedia's)
+    # 0.9.8: which list was used, and what is needed to switch lists later without a new scan
+    source: str = "qobuz"         # "qobuz" or "wikipedia"
+    note: str = ""                # e.g. the Wikipedia page used, or why Wikipedia wasn't
+    owned_titles: list = field(default_factory=list)     # your album names for this artist
+    qobuz_studio: list = field(default_factory=list)     # Qobuz's own studio albums (slim dicts)
+    names: list = field(default_factory=list)            # the names to look the artist up under
 
 
 # ---- helpers ---------------------------------------------------------------------
@@ -156,13 +163,19 @@ def locate_folder(library_root, artist, album_name, extra_artists=()):
 
 class Scanner:
     def __init__(self, session, library_root, use_musicbrainz=False, progress=None, should_stop=None,
-                 prefer_explicit=True):
+                 prefer_explicit=True, studio=None, use_qobuz=False, only_artists=None):
         self.session = session            # client.Session (Qobuz)
         self.library_root = library_root
         self.use_mb = use_musicbrainz
         self.progress = progress or (lambda *_: None)
         self.should_stop = should_stop or (lambda: False)
         self.prefer_explicit = prefer_explicit
+        self.studio = studio or studio_mod.Choice()     # Qobuz's list everywhere unless told otherwise
+        # By default a scan never contacts Qobuz: your library (Navidrome), your folders and Wikipedia only.
+        # use_qobuz adds the checks that need Qobuz's catalogue; only_artists limits the scan to those artists.
+        self.use_qobuz = use_qobuz
+        self.only = {matching.norm_artist(a) for a in only_artists} if only_artists else None
+        self.note = ""
         self._last_qobuz = 0.0
 
     # ---- Qobuz (throttled + cached)
@@ -224,10 +237,14 @@ class Scanner:
             by_artist.setdefault(a.get("artist") or "Unknown", []).append(a)
 
         issues, completion = [], []
-        self._split_check(albums, issues)
-        self._location_check(issues)
+        if self.only is None:                           # library-wide checks; not for a few chosen artists
+            self._split_check(albums, issues)
+            self._location_check(issues)
         details_by_id = {}
         artists = sorted(by_artist, key=str.casefold)
+        if self.only is not None:
+            artists = [a for a in artists if matching.norm_artist(a) in self.only
+                       or any(matching.norm_artist(n) in self.only for n in matching.artist_names(a))]
         for n, artist in enumerate(artists, 1):
             if self.should_stop():
                 break
@@ -239,7 +256,12 @@ class Scanner:
                     if n not in names:
                         names.append(n)
             try:
-                qobuz = self.discography_for(names)
+                qobuz = self.discography_for(names) if self.use_qobuz else []
+            except QobuzBlocked as e:                   # blocked, paused or out of budget: no more Qobuz this scan
+                self.note = str(e)
+                self.use_qobuz, qobuz = False, []
+                if self.only is not None:
+                    break
             except Exception:
                 qobuz = []
             check = None
@@ -259,7 +281,11 @@ class Scanner:
                 self._album_issues(artist, al, details, qobuz, check, issues, names)
             if qobuz:
                 completion.append(self._completion(artist, lib_albums, qobuz, check, names))
-        if not self.should_stop():
+            elif not self.use_qobuz:
+                done = self._completion_wikipedia(artist, lib_albums, names)
+                if done is not None:
+                    completion.append(done)
+        if not self.should_stop() and self.only is None:
             self._duplicate_check(albums, details_by_id, issues)
         return issues, completion
 
@@ -424,7 +450,52 @@ class Scanner:
                                 "url": f"{WEB_URL}album/{q['id']}", "explicit": q["parental_warning"],
                                 "quality": f"{qq[1]}-bit / {qq[2]:g} kHz"})
         total = len(studio)
-        return ArtistCompletion(artist, total - len(missing), total, missing, verified)
+        done = ArtistCompletion(artist, total - len(missing), total, missing, verified,
+                                owned_titles=[a.get("name", "") for a in lib_albums],
+                                qobuz_studio=list(studio.values()), names=list(names))
+        if self.studio.source_for(artist) == studio_mod.WIKI:
+            self._use_wikipedia(done, qobuz, owned_keys)
+        return done
+
+    def _completion_wikipedia(self, artist, lib_albums, names):
+        """Complete my artists without Qobuz: Wikipedia's studio list against your library. Downloads are
+        looked up on Qobuz only when you click Download, so the missing albums carry no link here."""
+        try:
+            found = wikipedia.studio_albums((names or [artist])[0], self.studio.lang)
+        except wikipedia.WikipediaError as e:
+            self.note = str(e)
+            return None
+        if found is None:
+            return None
+        owned_keys = set()
+        for a in lib_albums:
+            owned_keys |= matching.library_keys(a.get("name"))
+        rows = studio_mod.compare([], found["albums"], [], owned_keys)
+        owned, total, missing = studio_mod.counts(rows, studio_mod.WIKI)
+        return ArtistCompletion(artist, owned, total, missing, True, source=studio_mod.WIKI, note=found["page"],
+                                owned_titles=[a.get("name", "") for a in lib_albums], names=list(names))
+
+    def _use_wikipedia(self, done, qobuz, owned_keys):
+        """Switches a completion over to Wikipedia's list; keeps Qobuz's (with a note) when that fails."""
+        try:
+            found = wikipedia.studio_albums((done.names or [done.artist])[0], self.studio.lang)
+        except wikipedia.WikipediaError as e:
+            done.note = f"{e} — using Qobuz's list"
+            return
+        if found is None:
+            done.note = "Not found on Wikipedia — using Qobuz's list"
+            return
+        rows = studio_mod.compare(done.qobuz_studio, found["albums"], qobuz, owned_keys)
+        done.owned, done.total, done.missing = studio_mod.counts(rows, studio_mod.WIKI)
+        done.source, done.note = studio_mod.WIKI, found["page"]
+
+
+def cached_discography(names):
+    """What an earlier look already saved of these artists' Qobuz catalogue, whatever its age. No request."""
+    out = []
+    for n in names:
+        out.append(cache.get("qobuz_artist", _title_key(n)) or [])
+    return matching.merge_discographies(out)
 
 
 # ---- fixes (run from worker threads) ----------------------------------------------

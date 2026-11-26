@@ -112,6 +112,23 @@ class Navidrome:
                 return out
             offset += page
 
+    def album_list(self, kind, limit=200):
+        """Albums for a Subsonic list type: frequent (most played), starred, recent, newest …"""
+        out, offset = [], 0
+        while len(out) < limit:
+            size = min(100, limit - len(out))
+            body = self.call("getAlbumList2", type=kind, size=size, offset=offset)
+            batch = (body.get("albumList2") or {}).get("album") or []
+            out.extend(batch)
+            if len(batch) < size:
+                break
+            offset += size
+        return out
+
+    def artist_info(self, artist_id, count=20):
+        """Similar artists from Navidrome (it asks Last.fm), including ones that aren't in the library."""
+        return self.call("getArtistInfo2", id=artist_id, count=count, includeNotPresent="true")
+
     def album(self, album_id):
         return self.call("getAlbum", id=album_id).get("album") or {}
 
