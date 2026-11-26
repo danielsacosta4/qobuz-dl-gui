@@ -42,6 +42,7 @@ class JobRunner(QObject):
     prompt = Signal(object, str)       # job, prompt text
     authProblem = Signal(str)
     blocked = Signal(str)              # Qobuz says the account is blocked: everything is stopped
+    queueChanged = Signal()            # the order of the waiting jobs, or the pause, changed
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -50,6 +51,7 @@ class JobRunner(QObject):
         self.proc = None
         self.parser = None
         self.decoder = None
+        self.paused = False            # when set, no new job starts (the running one finishes)
         self._kill_timer = QTimer(self)
         self._kill_timer.setSingleShot(True)
         self._kill_timer.setInterval(5000)
@@ -61,6 +63,32 @@ class JobRunner(QObject):
         self.jobAdded.emit(job)
         self._start_next()
         return job
+
+    def retry(self, job):
+        """Queues a fresh copy of a failed or stopped download. Returns the new job, or None when it can't be."""
+        if job.status not in ("failed", "stopped") or job.program:
+            return None
+        return self.enqueue(Job(job.title, list(job.args), env=dict(job.env), success_text=job.success_text))
+
+    def move(self, job, delta):
+        """Moves a waiting job one place up (-1) or down (+1) among the waiting jobs. True when it moved."""
+        waiting = self.pending()
+        if job not in waiting:
+            return False
+        k = waiting.index(job) + delta
+        if not 0 <= k < len(waiting):
+            return False
+        a, b = self.jobs.index(job), self.jobs.index(waiting[k])
+        self.jobs[a], self.jobs[b] = self.jobs[b], self.jobs[a]
+        self.queueChanged.emit()
+        return True
+
+    def set_paused(self, on):
+        """Paused: the running job finishes, and nothing else starts until you resume."""
+        self.paused = bool(on)
+        self.queueChanged.emit()
+        if not self.paused:
+            self._start_next()
 
     def remove(self, job):
         if job.status == "queued":
@@ -82,7 +110,7 @@ class JobRunner(QObject):
         return [j for j in self.jobs if j.status == "queued"]
 
     def _start_next(self):
-        if self.current is not None:
+        if self.current is not None or self.paused:
             return
         nxt = next((j for j in self.jobs if j.status == "queued"), None)
         if nxt is None:

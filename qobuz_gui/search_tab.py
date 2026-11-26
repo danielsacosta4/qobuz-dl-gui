@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 
 from . import cache, classify, matching, musicbrainz, prefs, studio, theme, wikipedia
 from .client import run_async
-from .studio_dialog import StudioCompare
+from .studio_dialog import EMPTY_LIST, StudioCompare, no_list_found
 
 WEB_URL = "https://play.qobuz.com/"
 MAX_WIKI_ARTISTS = 5          # Wikipedia lists looked up per result list (about a second or three each)
@@ -112,9 +112,9 @@ class WikiBatch(QThread):
     """Loads Wikipedia's studio albums for a few artists, one at a time (the module throttles requests)."""
     loaded = Signal(str, object, str)      # artist, found | None, error
 
-    def __init__(self, artists, lang):
+    def __init__(self, artists, choice):
         super().__init__()
-        self.artists, self.lang = list(artists), lang
+        self.artists, self.choice = list(artists), choice      # a studio.Choice snapshot from the GUI thread
         self._stop = False
 
     def stop(self):
@@ -125,7 +125,7 @@ class WikiBatch(QThread):
             if self._stop:
                 return
             try:
-                found = wikipedia.studio_albums(name, self.lang)
+                found = self.choice.albums_for(name)
             except wikipedia.WikipediaError as e:
                 self.loaded.emit(name, None, str(e))
                 return                      # Wikipedia is unreachable: don't try the rest
@@ -474,7 +474,7 @@ class SearchTab(QWidget):
         if self._wiki_batch is not None:
             self._wiki_batch.stop()
         self._wiki_pending |= {matching.norm_artist(a) for a in need}
-        batch = WikiBatch(need, self._choice.lang)
+        batch = WikiBatch(need, self._choice)
         batch.loaded.connect(lambda name, found, error, b=batch: self._wiki_loaded(b, name, found, error))
         batch.finished.connect(lambda b=batch: self._wiki_batch_done(b))
         self._wiki_batch = batch
@@ -545,7 +545,15 @@ class SearchTab(QWidget):
             index = self.index_provider()
             owned = (lambda t: index.status(None, artist, t) == "library") if index is not None else (lambda t: False)
             rows = studio.compare(self._qobuz_studio(mine, artist), found["albums"], mine, owned)
-            dlg = StudioCompare(self, artist, rows, self._choice.source_for(artist), found["page"], partial=partial)
+            dlg = StudioCompare(self, artist, rows, self._choice.source_for(artist), found["page"], partial=partial,
+                                override=self._choice.override_for(artist), removed=found.get("removed") or ())
+
+            def corrected(action):
+                studio.edit_override(artist, action)
+                self._choice = studio.Choice.load()
+                self.wikis.pop(matching.norm_artist(artist), None)     # read the list again, corrections included
+                self._compare()
+            dlg.overrideRequested.connect(corrected)
 
             def chosen(source):
                 studio.set_source(artist, source)
@@ -564,15 +572,22 @@ class SearchTab(QWidget):
         if entry and entry.get("found"):
             show(entry["found"])
             return
-        lang = self._choice.lang
+        choice = self._choice
         self.status(f"Reading {artist}'s studio albums from Wikipedia…")
 
         def done(found):
             if found is None:
-                self.status(f"Wikipedia has no usable list of studio albums for {artist}.", error=True)
-            else:
-                show(found)
-        run_async(lambda: wikipedia.studio_albums(artist, lang), done,
+                if no_list_found(self, artist, choice):
+                    self._choice = studio.Choice.load()
+                    self._compare()
+                    return
+                show(EMPTY_LIST)                 # nothing on Wikipedia: the window still opens, so you can add albums
+                return
+            if choice.source_for(artist) == studio.WIKI:
+                self._set_wiki(artist, found)    # the table follows the list as it is now
+                self._render_current(keep_scroll=True)
+            show(found)
+        run_async(lambda: choice.albums_for(artist), done,
                   lambda m: self.status(f"Couldn't read Wikipedia: {m}", error=True))
 
     def _queue_picked(self, artist, picked):

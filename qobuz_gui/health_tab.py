@@ -7,14 +7,14 @@ import os
 from PySide6.QtCore import QThread, Qt, QUrl, Signal
 from PySide6.QtGui import QBrush, QColor, QDesktopServices
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel, QMessageBox,
+    QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel, QMessageBox,
     QProgressBar, QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from . import automation, doctor, history, matching, musicbrainz, navidrome, prefs, qobuz_guard, rules, safeio, studio, theme, wikipedia
+from . import automation, doctor, history, matching, musicbrainz, navidrome, prefs, qobuz_guard, rules, safeio, studio, theme
 from .client import run_async
 from .library_tab import library_folder
-from .studio_dialog import StudioCompare
+from .studio_dialog import EMPTY_LIST, StudioCompare, no_list_found
 
 IGNORED = rules.EXCEPTIONS
 FIX_TEXT = {
@@ -477,6 +477,9 @@ class HealthTab(QWidget):
             mh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
         self.btn_get_missing = QPushButton("Download ticked")
         self.btn_get_all = QPushButton("Download everything missing for selected artists")
+        self.btn_export = QPushButton("Export missing…")
+        self.btn_export.setToolTip("Save the missing albums of the selected artists (or of every artist shown, when "
+                                   "none is selected) as a CSV or text file")
         self.btn_compare = QPushButton("Compare Qobuz / Wikipedia…")
         self.btn_compare.setToolTip("See both lists of studio albums for this artist side by side and choose "
                                     "which one to count (remembered for this artist)")
@@ -495,6 +498,7 @@ class HealthTab(QWidget):
         rb.addWidget(self.btn_compare)
         rb.addWidget(self.btn_qobuz_check)
         rb.addWidget(self.btn_get_all)
+        rb.addWidget(self.btn_export)
         rb.addStretch(1)
         rb.addWidget(self.btn_get_missing)
         rv.addLayout(rb)
@@ -521,6 +525,7 @@ class HealthTab(QWidget):
         self.art_table.itemSelectionChanged.connect(self._show_missing)
         self.btn_get_missing.clicked.connect(self._download_ticked_missing)
         self.btn_get_all.clicked.connect(self._download_all_missing)
+        self.btn_export.clicked.connect(self._export_missing)
         self.btn_compare.clicked.connect(self._compare_lists)
         self.btn_qobuz_check.clicked.connect(self._qobuz_check)
         return w
@@ -588,7 +593,7 @@ class HealthTab(QWidget):
         if len(sel) != 1:
             return
         c = sel[0]
-        lang = studio.Choice.load().lang
+        choice = studio.Choice.load()
         self.btn_compare.setEnabled(False)
         self.status(f"Reading {c.artist}'s studio albums from Wikipedia…")
 
@@ -600,24 +605,37 @@ class HealthTab(QWidget):
                 qall = doctor.cached_discography(c.names or [c.artist])
             qall = [q for q in qall if matching.artist_matches((q.get("artist") or {}).get("name", ""),
                                                                 c.names or [c.artist])]
-            return qall, wikipedia.studio_albums(name, lang)
+            return qall, choice.albums_for(c.artist, name)
 
         def done(result):
             self.btn_compare.setEnabled(True)
             qall, found = result
-            if found is None:
-                QMessageBox.information(self, "Wikipedia", f"Wikipedia has no usable list of studio albums for "
-                                        f"{c.artist}, so Qobuz's list is used.")
-                self.status("")
-                return
             self.status("")
+            if found is None:
+                if no_list_found(self, c.artist, choice):
+                    self._compare_lists(load_qobuz)
+                    return
+                found = EMPTY_LIST               # nothing on Wikipedia: the window still opens, so you can add albums
             keys = set()
             for name in c.owned_titles:
                 keys |= matching.library_keys(name)
             rows = studio.compare(c.qobuz_studio, found["albums"], qall, keys)
+            if c.source == studio.WIKI and found["albums"]:
+                # keep the table in step with the list as it is now (your corrections included)
+                c.owned, c.total, c.missing = studio.counts(rows, studio.WIKI)
+                c.note = found["page"]
+                doctor.save_results(self.issues, self.completion)
+                self._fill_artists()
+                self._reselect(c)
             dlg = StudioCompare(self, c.artist, rows, c.source, found["page"], qobuz_loaded=bool(qall or c.qobuz_studio),
-                                can_load=not prefs.safe_mode())
+                                can_load=not prefs.safe_mode(), override=choice.override_for(c.artist),
+                                removed=found.get("removed") or ())
             dlg.loadQobuz.connect(lambda: (dlg.accept(), self._compare_lists(load_qobuz=True)))
+
+            def corrected(action):
+                studio.edit_override(c.artist, action)
+                self._compare_lists(load_qobuz)            # reads the list again and reopens this window
+            dlg.overrideRequested.connect(corrected)
 
             def chosen(source):
                 studio.set_source(c.artist, source)
@@ -625,7 +643,7 @@ class HealthTab(QWidget):
                 c.source, c.note = source, found["page"] if source == studio.WIKI else ""
                 doctor.save_results(self.issues, self.completion)
                 self._fill_artists()
-                self._show_missing()
+                self._reselect(c)
             dlg.sourceChosen.connect(chosen)
             dlg.downloadRequested.connect(lambda picked: self._queue_missing([(c.artist, {"title": t, "url": u})
                                                                               for t, u in picked]))
@@ -635,6 +653,37 @@ class HealthTab(QWidget):
             self.btn_compare.setEnabled(True)
             self.status(f"Couldn't compare: {msg}", error=True)
         run_async(work, done, fail)
+
+    def _export_missing(self):
+        chosen = self._selected_artists() or self._sorted_completion()
+        rows = studio.missing_rows(chosen)
+        if not rows:
+            self.status("Nothing is missing for the artists shown.")
+            return
+        path, _filter = QFileDialog.getSaveFileName(
+            self, "Export missing albums", os.path.expanduser("~/missing-albums.csv"),
+            "Spreadsheet (*.csv);;Plain text (*.txt)")
+        if not path:
+            return
+        text = studio.missing_text(rows) if path.lower().endswith(".txt") else studio.missing_csv(rows)
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+        except OSError as e:
+            self.status(f"Couldn't save the list: {e}", error=True)
+            return
+        artists = len({r[0] for r in rows})
+        self.status(f"Saved {len(rows)} missing album{'s' if len(rows) != 1 else ''} from {artists} "
+                    f"artist{'s' if artists != 1 else ''} to {path}")
+
+    def _reselect(self, completion):
+        """Selects an artist's row again after the table was refilled (and shows their missing albums)."""
+        for r in range(self.art_table.rowCount()):
+            item = self.art_table.item(r, 0)
+            if item is not None and self.completion[item.data(Qt.UserRole)] is completion:
+                self.art_table.selectRow(r)
+                break
+        self._show_missing()
 
     def _queue_missing(self, entries):
         """Queue downloads for [(artist, {title, url})]. A missing album found through Wikipedia has no Qobuz

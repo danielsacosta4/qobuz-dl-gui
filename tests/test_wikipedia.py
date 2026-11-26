@@ -145,3 +145,16 @@ def test_portuguese_section_name(monkeypatch):
     monkeypatch.setattr(wikipedia, "_get", fake)
     got = wikipedia.studio_albums("Banda", lang="pt")
     assert got["lang"] == "pt" and len(got["albums"]) == 3
+
+
+def test_a_page_you_name(monkeypatch):
+    fake = FakeWiki({"Band (group)", "Empty page"},
+                    {"Band (group)": [{"line": "Studio albums", "index": "3"}], "Empty page": [{"line": "History", "index": "1"}]},
+                    {("Band (group)", "3"): TABLE}, redirects={"Band group": "Band (group)"})
+    monkeypatch.setattr(wikipedia, "_get", fake)
+    got = wikipedia.studio_albums_from_page("Band group")
+    assert got["page"] == "Band (group)" and len(got["albums"]) == 3
+    n = len(fake.calls)
+    assert wikipedia.studio_albums_from_page("Band group") == got and len(fake.calls) == n      # cached
+    assert wikipedia.studio_albums_from_page("Empty page") is None                             # no such section
+    assert wikipedia.studio_albums_from_page("No such page") is None

@@ -4,7 +4,7 @@ Qt-free. `compare` lines the two lists up (and your library) so the differences 
 turns the rows into owned / total / missing for whichever list is chosen.
 """
 
-from . import library, matching, prefs
+from . import library, matching, prefs, wikipedia
 
 QOBUZ, WIKI = "qobuz", "wikipedia"
 LABEL = {QOBUZ: "Qobuz", WIKI: "Wikipedia"}
@@ -14,18 +14,34 @@ LABEL = {QOBUZ: "Qobuz", WIKI: "Wikipedia"}
 class Choice:
     """A snapshot of the settings, taken on the GUI thread so a scan thread never touches QSettings."""
 
-    def __init__(self, default=QOBUZ, per_artist=None, lang="en"):
+    def __init__(self, default=QOBUZ, per_artist=None, lang="en", overrides=None):
         self.default = default if default in LABEL else QOBUZ
         self.per_artist = dict(per_artist or {})
         self.lang = lang or "en"
+        self.overrides = dict(overrides or {})      # your corrections to Wikipedia's lists, per artist
 
     @classmethod
     def load(cls):
         return cls(prefs.get_str(prefs.STUDIO_DEFAULT, QOBUZ), prefs.get_json(prefs.STUDIO_SOURCES, {}) or {},
-                   prefs.get_str(prefs.WIKI_LANG, "en"))
+                   prefs.get_str(prefs.WIKI_LANG, "en"), prefs.get_json(prefs.STUDIO_OVERRIDES, {}) or {})
 
     def source_for(self, artist):
         return self.per_artist.get(matching.norm_artist(artist), self.default)
+
+    def override_for(self, artist):
+        return self.overrides.get(matching.norm_artist(artist)) or {}
+
+    def albums_for(self, artist, lookup_name=None, refresh=False):
+        """Wikipedia's studio albums for an artist with your corrections applied: {"albums", "page", "lang",
+        "edited", "removed"}, or None when there is no list. `lookup_name` is the name to search Wikipedia
+        for when it differs from the artist's library name. Raises wikipedia.WikipediaError when Wikipedia
+        can't be reached. Makes network requests: call it from a worker thread."""
+        o = self.override_for(artist)
+        if o.get("page"):
+            found = wikipedia.studio_albums_from_page(o["page"], o.get("lang") or self.lang, refresh)
+        else:
+            found = wikipedia.studio_albums(lookup_name or artist, self.lang, refresh)
+        return apply_overrides(found, o, self.lang)
 
 
 def set_source(artist, source):
@@ -39,6 +55,87 @@ def set_source(artist, source):
         stored[key] = source
     prefs.set_json(prefs.STUDIO_SOURCES, stored)
     return stored
+
+
+# ---- your corrections to a Wikipedia list ---------------------------------------------------------------------
+def apply_overrides(found, o, lang="en"):
+    """Wikipedia's answer with your added and removed albums applied. `found` may be None (no list on
+    Wikipedia): albums you added then make a list of their own."""
+    if not o or not (o.get("add") or o.get("remove")):
+        if found is not None and o and o.get("page"):
+            return {**found, "edited": True, "removed": []}
+        return found
+    albums = [dict(a) for a in (found or {}).get("albums") or []]
+    removed = []
+    for title in o.get("remove") or []:
+        keys = _keys(title)
+        hit = [a for a in albums if titles_match(_keys(a["title"]), keys)]
+        if hit:
+            removed.append(hit[0]["title"])
+            albums = [a for a in albums if a not in hit]
+    for extra in o.get("add") or []:
+        keys = _keys(extra.get("title", ""))
+        if keys and not any(titles_match(_keys(a["title"]), keys) for a in albums):
+            albums.append({"title": extra["title"], "year": extra.get("year"), "added": True})
+    if not albums and found is None:
+        return None
+    if any(a.get("added") for a in albums):
+        albums.sort(key=lambda a: a.get("year") or 9999)        # stable: Wikipedia's order is kept within a year
+    return {"albums": albums, "page": (found or {}).get("page") or "your own list",
+            "lang": (found or {}).get("lang") or lang, "edited": True, "removed": removed}
+
+
+def edited_override(o, action):
+    """A copy of one artist's corrections after an action: {"op": "add", "title", "year"} · {"op": "remove",
+    "title"} · {"op": "restore", "title"} · {"op": "page", "page", "lang"} · {"op": "reset"}."""
+    o = {"page": o.get("page", ""), "lang": o.get("lang", ""), "add": [dict(a) for a in o.get("add") or []],
+         "remove": list(o.get("remove") or [])}
+    op, title = action.get("op"), str(action.get("title") or "").strip()
+    keys = _keys(title) if title else set()
+
+    def same(other):
+        return titles_match(_keys(other), keys)
+    if op == "reset":
+        return {}
+    if op == "page":
+        o["page"], o["lang"] = str(action.get("page") or "").strip(), str(action.get("lang") or "")
+    elif op == "add" and keys:
+        o["remove"] = [t for t in o["remove"] if not same(t)]
+        if not any(same(a["title"]) for a in o["add"]):
+            o["add"].append({"title": title, "year": action.get("year")})
+    elif op == "remove" and keys:
+        if any(same(a["title"]) for a in o["add"]):
+            o["add"] = [a for a in o["add"] if not same(a["title"])]       # it was yours: just take it back out
+        elif not any(same(t) for t in o["remove"]):
+            o["remove"].append(title)
+    elif op == "restore" and keys:
+        o["remove"] = [t for t in o["remove"] if not same(t)]
+    if not (o["page"] or o["add"] or o["remove"]):
+        return {}
+    return o
+
+
+def edit_override(artist, action):
+    """Applies an action to one artist's corrections and saves them. Returns the artist's corrections."""
+    stored = dict(prefs.get_json(prefs.STUDIO_OVERRIDES, {}) or {})
+    key = matching.norm_artist(artist)
+    new = edited_override(stored.get(key) or {}, action)
+    if new:
+        stored[key] = new
+    else:
+        stored.pop(key, None)
+    prefs.set_json(prefs.STUDIO_OVERRIDES, stored)
+    return new
+
+
+def parse_title_year(text):
+    """("Title", 1999) from "Title (1999)", "Title, 1999" or "Title 1999"; the year is None when there is none."""
+    import re
+    text = str(text or "").strip()
+    m = re.match(r"^(.*?)[\s,]*[\[(]?\b(19[5-9]\d|20[0-4]\d)\b[\])]?\s*$", text)
+    if m and m.group(1).strip():
+        return m.group(1).strip(), int(m.group(2))
+    return text, None
 
 
 # ---- which artist a result list is about -------------------------------------------------------------------
@@ -122,6 +219,7 @@ def compare(qobuz_studio, wiki, qobuz_all, owned_keys):
         best = hits[0] if hits else None
         used.update(id(h) for h in find_qobuz(w["title"], qobuz_studio))
         row = {"title": w["title"], "year": w.get("year"), "on_wikipedia": True, "on_qobuz": in_studio,
+               "added": bool(w.get("added")),
                "owned": _owned(w["title"], owned_keys), "url": "", "explicit": False, "quality": "",
                "qobuz_kind": bool(best and not in_studio), "id": None}
         if best:
@@ -156,3 +254,40 @@ def newest(wiki):
         if best is None or (w.get("year") or 0) >= (best.get("year") or 0):
             best = w
     return best
+
+
+# ---- a list of what is missing, to save --------------------------------------------------------------------
+EXPORT_COLUMNS = ["Artist", "Album", "Year", "List", "Qobuz link"]
+
+
+def missing_rows(completions):
+    """One row per missing album, for doctor.ArtistCompletion-like objects: [artist, album, year, list, link]."""
+    rows = []
+    for c in sorted(completions, key=lambda c: c.artist.casefold()):
+        for m in c.missing:
+            rows.append([c.artist, m.get("title", ""), str(m.get("year") or ""),
+                         LABEL.get(getattr(c, "source", QOBUZ), "Qobuz"), m.get("url") or ""])
+    return rows
+
+
+def missing_csv(rows):
+    import csv
+    import io
+    out = io.StringIO()
+    writer = csv.writer(out, lineterminator="\n")
+    writer.writerow(EXPORT_COLUMNS)
+    writer.writerows(rows)
+    return out.getvalue()
+
+
+def missing_text(rows):
+    """Plain text, grouped by artist: easy to read or print."""
+    lines, last = [], None
+    for artist, album, year, _source, _link in rows:
+        if artist != last:
+            if lines:
+                lines.append("")
+            lines.append(artist)
+            last = artist
+        lines.append(f"  - {album}" + (f" ({year})" if year else ""))
+    return "\n".join(lines) + ("\n" if lines else "")

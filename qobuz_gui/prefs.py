@@ -84,6 +84,7 @@ DISCOVER_DISMISSED = "discover_dismissed"      # norm artist names you said no t
 STUDIO_DEFAULT = "studio_default"              # "qobuz" or "wikipedia" for artists without their own choice
 STUDIO_SOURCES = "studio_sources"              # {norm artist: "qobuz" | "wikipedia"}
 WIKI_LANG = "wiki_lang"
+STUDIO_OVERRIDES = "studio_overrides"          # {norm artist: {page, lang, add: [{title, year}], remove: [title]}}
 
 # Qobuz contact (0.10.0)
 QOBUZ_BUDGET = "qobuz_budget"                  # background Qobuz requests allowed per day (0 = none)

@@ -23,7 +23,8 @@ and uses its own `~/.config/qobuz-dl/config.ini`, so the app and the `qobuz-dl` 
   have it (✔ library, ↓ download history). Filters: release types, *Prefer explicit*, *Official only*, hidden
   releases/labels. Artist pages show how many official studio albums you own and offer *Download discography*.
 - **Download** — links or a `.txt` list (resumable), quality, folder and per-download options. Warns before
-  re-downloading an album you already have.
+  re-downloading an album you already have. The queue can be paused and reordered, and a failed
+  download retried.
 - **Library** — sends finished downloads to the library as `Letter/Artist/Album`, reusing existing artist folders and
   verifying every copy. Same album already there in another quality? Replace it, keep both or skip; replaced copies go
   to a hidden bin until you empty it. Navidrome rescans afterwards.
@@ -33,12 +34,14 @@ and uses its own `~/.config/qobuz-dl/config.ini`, so the app and the `qobuz-dl` 
     problem has a fix (previewed, verified, undoable) or can be marked as an exception. **The scan does not contact
     Qobuz.**
   - *Complete my artists*: your albums against **Wikipedia's** studio-album lists, per artist, with the missing ones
-    one click away (the Qobuz link is looked up when you click Download). *Check on Qobuz* adds the checks that need
+    one click away (the Qobuz link is looked up when you click Download). *Export missing…* saves the list as a
+    CSV or text file. *Check on Qobuz* adds the checks that need
     Qobuz's catalogue — Hi-Res or explicit version available, missing tracks, covers — for the artists you pick,
     within a small daily limit you set.
 - **Studio albums from Qobuz or Wikipedia** — choose per artist (or for everyone) which list counts as the artist's
   studio albums (on album searches and artist pages), with a side-by-side comparison. Wikipedia pages are read
-  through its public API (English, Portuguese, Spanish, French or German).
+  through its public API (English, Portuguese, Spanish, French or German). When a list is wrong you can
+  correct it yourself: add or remove albums, or point the artist at another Wikipedia page.
 - **Discover** (hidden while Safe mode is on) — artists you don't have yet, similar to the ones in your library
   according to your **Navidrome** server (which asks Last.fm), optionally weighted by what you play. Qobuz is only
   asked when you press *Search on Qobuz* or *Download latest album*.

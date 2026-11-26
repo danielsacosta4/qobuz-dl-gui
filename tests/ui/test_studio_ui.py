@@ -112,3 +112,32 @@ def test_compare_in_complete_my_artists_makes_no_qobuz_request_and_remembers_the
     table = h.missing_table
     assert table.item(1, 3).text() == "looked up on Qobuz when you download"
     assert table.item(1, 0).flags() & Qt.ItemIsUserCheckable
+
+
+def test_correcting_a_list_from_search_updates_the_results(make_window, env):
+    asked = []
+    win, q = setup(make_window, env, asked)
+    studio.set_source("Band", studio.WIKI)
+    s = win.search
+    s.show(BAND, "albums", "Albums for “band”")
+    assert wait_for(lambda: kinds(win)["Third (Deluxe Edition)"] == "Studio album", 5)
+    assert "2 of 4" in s.heading.text()
+
+    steps = [{"op": "remove", "title": "Third"}, None]
+    seen = []
+
+    def fake_exec(dialog):
+        seen.append(([r["title"] for r in dialog.rows if r["on_wikipedia"]], list(dialog.removed)))
+        action = steps[len(seen) - 1]
+        if action:
+            dialog.overrideRequested.emit(action)
+    env.monkeypatch.setattr(studio_dialog.StudioCompare, "exec", fake_exec)
+    q.calls.clear()
+    s._compare()
+    assert wait_for(lambda: len(seen) == 2, 10), seen
+    assert seen[0] == (["First", "Second", "Third", "Lost Album"], [])
+    assert seen[1] == (["First", "Second", "Lost Album"], ["Third"])
+    settle(0.2)
+    assert kinds(win)["Third (Deluxe Edition)"] != "Studio album"      # the results follow your correction
+    assert "1 of 3" in s.heading.text() and q.calls == []
+    assert studio.Choice.load().override_for("band") == {"page": "", "lang": "", "add": [], "remove": ["Third"]}
