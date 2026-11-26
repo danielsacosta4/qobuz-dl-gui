@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QListWidget, QMessageBox, QPushButton, QVBoxLayout, QWidget,
 )
 
-from . import config, prefs, updates
+from . import config, prefs, theme, updates
 from .download_tab import FolderPicker, describe, quality_combo, set_quality
 from .client import run_async
 from .jobs import Job
@@ -160,11 +160,21 @@ class ToolsTab(QWidget):
         row5.addStretch(1)
         l4.addLayout(row5)
 
+        # Keyboard shortcuts
+        from .shortcuts import SHORTCUTS
+        keys = QGroupBox("Keyboard shortcuts")
+        kl = QLabel("<table>" + "".join(
+            f"<tr><td style='padding-right:14px'><b>{html.escape(k)}</b></td><td>{html.escape(t)}</td></tr>"
+            for k, t in SHORTCUTS) + "</table>")
+        kl.setTextFormat(Qt.RichText)
+        QVBoxLayout(keys).addWidget(kl)
+
         lay = QVBoxLayout(self)
         lay.addWidget(lyr)
         lay.addWidget(db)
         lay.addWidget(upd)
         lay.addWidget(files)
+        lay.addWidget(keys)
         lay.addStretch(1)
 
         self.btn_check.clicked.connect(lambda: self.check_updates(manual=True))
@@ -184,7 +194,7 @@ class ToolsTab(QWidget):
     def show_update_info(self, info, error=""):
         local = updates.installed_version()
         if error:
-            text = f"Installed: <b>{local}</b>. <span style='color:#e5534b'>Couldn't check GitHub: {error}</span>"
+            text = f"Installed: <b>{local}</b>. <span style='color:{theme.ERROR}'>Couldn't check GitHub: {error}</span>"
         elif not info:
             text = f"Installed: <b>{local}</b>. Not checked yet."
         else:
@@ -193,7 +203,7 @@ class ToolsTab(QWidget):
             change = f"<br><span style='color:gray'>{html.escape(info['message'])}</span>" if info.get("message") else ""
             link = f" · <a href='{updates.COMMITS_PAGE}'>see changes</a>"
             if newer:
-                text = (f"<b style='color:#3fa65a'>qobuz-dl {info['latest']} is available</b> "
+                text = (f"<b style='color:{theme.OK}'>qobuz-dl {info['latest']} is available</b> "
                         f"(installed: {local}){when}{link}{change}")
             else:
                 text = f"Installed: <b>{local}</b> — up to date with GitHub ({info.get('latest')}){when}{link}"
@@ -203,9 +213,9 @@ class ToolsTab(QWidget):
         local = updates.gui_installed_version()
         link = f"<a href='https://github.com/{updates.GUI_REPO}'>github.com/{updates.GUI_REPO}</a>"
         if error:
-            text = f"Qobuz-DL GUI <b>{local}</b>. <span style='color:#e5534b'>Couldn't check GitHub: {html.escape(error)}</span>"
+            text = f"Qobuz-DL GUI <b>{local}</b>. <span style='color:{theme.ERROR}'>Couldn't check GitHub: {html.escape(error)}</span>"
         elif info and updates.is_newer(info.get("latest", "0"), local):
-            text = (f"<b style='color:#3fa65a'>Qobuz-DL GUI {info['latest']} is available</b> (installed: {local}) · "
+            text = (f"<b style='color:{theme.OK}'>Qobuz-DL GUI {info['latest']} is available</b> (installed: {local}) · "
                     f"<a href='{updates.GUI_COMMITS_PAGE}'>see changes</a>")
         elif info:
             text = f"Qobuz-DL GUI <b>{local}</b> — up to date · {link}"
@@ -245,7 +255,7 @@ class ToolsTab(QWidget):
             self.btn_gui_update.setText("Update this app from GitHub")
             self.btn_gui_update.setEnabled(True)
             self.btn_gui_update.setVisible(False)
-            self.gui_label.setText(f"<b style='color:#3fa65a'>Qobuz-DL GUI {html.escape(version)} installed.</b> "
+            self.gui_label.setText(f"<b style='color:{theme.OK}'>Qobuz-DL GUI {html.escape(version)} installed.</b> "
                                    "Restart the app to use it.")
             QMessageBox.information(self, "Qobuz-DL GUI updated",
                                     f"Version {version} is installed. Quit (tray icon → Quit) and open the app again.")

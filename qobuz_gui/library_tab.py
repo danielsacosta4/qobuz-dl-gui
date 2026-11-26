@@ -2,14 +2,14 @@
 
 import os
 
-from PySide6.QtCore import QThread, Qt, QUrl, Signal
+from PySide6.QtCore import QThread, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QBrush, QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QFormLayout, QHBoxLayout, QHeaderView, QLabel, QMessageBox,
     QProgressBar, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from . import config, history, library, prefs, rules, safeio
+from . import automation, config, history, library, prefs, rules, safeio, theme
 from .client import run_async
 from .download_tab import FolderPicker
 
@@ -85,6 +85,7 @@ class SendWorker(QThread):
 
 class LibraryTab(QWidget):
     librarySent = Signal()
+    autoSendDone = Signal(int, int, int)    # sent, failed, left for a decision
 
     def __init__(self, status, parent=None):
         super().__init__(parent)
@@ -92,6 +93,16 @@ class LibraryTab(QWidget):
         self.albums = []
         self.worker = None
         self._filling = False
+        self._scanning = False
+        self._rescan = False
+        self._after_scan = []
+        self._last_scan = None            # (tree signature, library) of the albums shown
+        self._auto = False
+        self._auto_left = 0
+        self._lib_timer = QTimer(self)        # typing a library path: rescan once, when it stops
+        self._lib_timer.setSingleShot(True)
+        self._lib_timer.setInterval(700)
+        self._lib_timer.timeout.connect(lambda: self.refresh(force=True))
 
         self.staging_label = QLabel()
         self.staging_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -161,7 +172,7 @@ class LibraryTab(QWidget):
         lay.addWidget(self.table, 1)
         lay.addLayout(buttons)
 
-        self.btn_refresh.clicked.connect(self.refresh)
+        self.btn_refresh.clicked.connect(lambda: self.refresh(force=True))
         self.btn_all.clicked.connect(lambda: self._tick_all(True))
         self.btn_none.clicked.connect(lambda: self._tick_all(False))
         self.btn_open.clicked.connect(self._open_staging)
@@ -178,39 +189,76 @@ class LibraryTab(QWidget):
     # ---- settings ------------------------------------------------------------
     def reload_settings(self):
         self.staging_label.setText(staging_folder() or "(not set — choose a download folder in Settings)")
-        self.refresh()
+        self.refresh(force=True)
 
     def _library_changed(self, value):
         prefs.set_value(prefs.LIBRARY_DIR, value.strip())
-        self._update_destinations()
+        self._lib_timer.start()
 
     def library_path(self):
         return os.path.expanduser(self.library.text())
 
     # ---- scanning ------------------------------------------------------------
-    def refresh(self):
+    def refresh(self, then=None, force=False):
+        """Re-reads the download folder in the background. Unless forced, nothing is re-read when
+        the folder tree hasn't changed since the last scan. `then` runs once the table is up to date."""
+        if then is not None:
+            self._after_scan.append(then)
         if self.worker and self.worker.isRunning():
+            self._after_scan.clear()
+            return
+        if self._scanning:
+            self._rescan = self._rescan or force
             return
         staging = staging_folder()
         if not staging or not os.path.isdir(staging):
             self.albums = []
+            self._last_scan = None
             self._fill()
             self.summary.setText("The download folder doesn't exist yet.")
+            self._run_after_scan()
             return
+        self._scanning = True
         self.btn_refresh.setEnabled(False)
-        self.summary.setText("Scanning…")
         lib = self.library_path()
         disc_prefix = config.get(config.load(), "multiple_disc_prefix", "CD") or "CD"
+        last = None if force else self._last_scan
+        if last is None:
+            self.summary.setText("Scanning…")
 
-        def done(albums):
+        def work():
+            sig = library.tree_signature(staging)
+            if last is not None and last == (sig, lib):
+                return None
+            albums = library.scan_staging(staging, lib, disc_prefix)
+            return sig, library.resolve_all(lib, albums)
+
+        def done(result):
+            self._scanning = False
             self.btn_refresh.setEnabled(True)
-            self.albums = albums
-            self._fill()
+            if self._rescan or lib != self.library_path():
+                self._rescan = False      # asked again while this scan ran: scan once more
+                self.refresh(force=True)
+                return
+            if result is not None:
+                sig, albums = result
+                self._last_scan = (sig, lib)
+                self.albums = albums
+                self._fill()
+            self._run_after_scan()
 
         def fail(msg):
+            self._scanning = False
             self.btn_refresh.setEnabled(True)
+            self._last_scan = None
             self.summary.setText(f"Scan failed: {msg}")
-        run_async(lambda: library.scan_staging(staging, lib, disc_prefix), done, fail)
+            self._after_scan.clear()
+        run_async(work, done, fail)
+
+    def _run_after_scan(self):
+        pending, self._after_scan = self._after_scan, []
+        for fn in pending:
+            fn()
 
     def _fill(self):
         self._filling = True
@@ -249,24 +297,25 @@ class LibraryTab(QWidget):
                 continue
             colour = None
             if album.kind == "playlist":
-                dest, status, colour = "—", "Playlist (mixed artists) — not sorted", "#8a8a8a"
+                dest, status, colour = "—", "Playlist (mixed artists) — not sorted", theme.MUTED
             elif album.state == "in_progress":
-                dest, status, colour = "—", "Still downloading", "#c99a2e"
+                dest, status, colour = "—", "Still downloading", theme.WARN
             else:
                 if lib_ok:
-                    full, status = library.destination(lib, album)
+                    if album.dest_status is None or album.dest_lib != lib:
+                        library.resolve(lib, album)   # one album (artist edited) or a library change
+                    full, status = album.dest, album.dest_status
                     dest = os.path.relpath(full, lib)
-                    album.dest = full
                 else:
                     dest, status = "—", "Library folder not found"
                     album.dest = None
                 if album.state == "incomplete":
                     status = "Incomplete download · " + status
-                    colour = "#c99a2e"
+                    colour = theme.WARN
                 elif "merge" in status or album.others:
-                    colour = "#c99a2e"
+                    colour = theme.WARN
                 elif lib_ok:
-                    colour = "#3fa65a"
+                    colour = theme.OK
                     ready += 1
             dest_cell.setText(dest)
             dest_cell.setToolTip(getattr(album, "dest", None) or dest)
@@ -292,7 +341,6 @@ class LibraryTab(QWidget):
         combo.setProperty("album_path", album.path)
         for key, label in ACTIONS:
             combo.addItem(label, key)
-        album.action = library.default_action(album)
         combo.setCurrentIndex([k for k, _ in ACTIONS].index(album.action))
         names = "\n".join(f"• {os.path.basename(p)} ({library.describe_quality(q)})" for p, q in album.others)
         combo.setToolTip(f"Already in the library:\n{names}")
@@ -303,7 +351,7 @@ class LibraryTab(QWidget):
         self.table.setCellWidget(row, C_ACTION, combo)
 
     def show_history(self):
-        history.HistoryDialog(self, on_change=self.refresh).exec()
+        history.HistoryDialog(self, on_change=lambda *_: self.refresh(force=True)).exec()
 
     def _empty_bin(self):
         lib = self.library_path()
@@ -338,6 +386,7 @@ class LibraryTab(QWidget):
             return
         album = self.albums[item.row()]
         album.artist = item.text().strip() or album.artist
+        album.dest_status = None
         self._update_destinations()
 
     def _tick_all(self, on):
@@ -373,6 +422,15 @@ class LibraryTab(QWidget):
                 for a, _, _ in jobs if a.others and a.action == "keep"]
         if kept:
             prefs.set_json(rules.EXCEPTIONS, sorted(set(prefs.get_json(rules.EXCEPTIONS, []) or []) | set(kept)))
+        plans = self._plans(jobs, lib)
+        if not history.preview(self, "Send to library", [p for _, p in plans],
+                               footer="Each file is read back from the share and compared (SHA-256) before the "
+                                      "next step. Replaced files go to the hidden bin, downloads to the desktop "
+                                      "Trash — both can be undone from History."):
+            return
+        self._start(plans, lib)
+
+    def _plans(self, jobs, lib):
         plans = []
         for album, dest, retire in jobs:
             plan = safeio.Plan(f"Send {album.artist} — {library.clean_album_name(album.name)}", lib)
@@ -382,18 +440,38 @@ class LibraryTab(QWidget):
             if self.delete_after.isChecked():
                 plan.trash(album.path)
             plans.append((album, plan))
-        if not history.preview(self, "Send to library", [p for _, p in plans],
-                               footer="Each file is read back from the share and compared (SHA-256) before the "
-                                      "next step. Replaced files go to the hidden bin, downloads to the desktop "
-                                      "Trash — both can be undone from History."):
-            return
+        return plans
 
+    def _start(self, plans, lib, auto=False):
+        self._auto = auto
         self.worker = SendWorker(plans, staging_folder(), self.delete_after.isChecked(), lib)
         self.worker.progress.connect(self._progress)
         self.worker.albumDone.connect(self._album_done)
         self.worker.allDone.connect(self._all_done)
         self._sending(True)
         self.worker.start()
+
+    def auto_send(self):
+        """Sends the finished downloads that need no decision (new to the library, nothing to merge
+        or replace), without the preview. Same checksums and History as a manual send."""
+        if self.busy():
+            return
+        lib = self.library_path()
+        if safeio.library_state(lib) != "ok":
+            self.status("Auto-send skipped: the library isn't available or hasn't been confirmed yet "
+                        "(send once by hand to confirm it).", error=True)
+            return
+
+        def go():
+            if self.busy():
+                return
+            ready = [a for a in self.albums if a.kind == "album" and a.state == "ready"]
+            albums = automation.auto_sendable(self.albums)
+            if not albums:
+                return
+            self._auto_left = len(ready) - len(albums)
+            self._start(self._plans([(a, a.dest, []) for a in albums], lib), lib, auto=True)
+        self.refresh(then=go, force=True)
 
     def _sending(self, on):
         for w in (self.btn_send, self.btn_refresh, self.btn_all, self.btn_none, self.library, self.delete_after,
@@ -413,7 +491,7 @@ class LibraryTab(QWidget):
             if album.path == path:
                 cell = self.table.item(r, C_STATUS)
                 cell.setText(("✔ " if ok else "✖ ") + message)
-                cell.setForeground(QBrush(QColor("#3fa65a" if ok else "#e5534b")))
+                cell.setForeground(QBrush(QColor(theme.OK if ok else theme.ERROR)))
 
     def _stop(self):
         if self.worker:
@@ -422,6 +500,7 @@ class LibraryTab(QWidget):
     def _all_done(self, sent, failed):
         self._sending(False)
         self.worker = None
+        auto, self._auto = self._auto, False
         msg = f"Sent {sent} album{'s' if sent != 1 else ''} to the library."
         if failed:
             msg += f" {failed} failed — see the Status column."
@@ -430,7 +509,9 @@ class LibraryTab(QWidget):
             self._rescan_navidrome(msg, bool(failed))
             self.librarySent.emit()
         if not failed:
-            self.refresh()
+            self.refresh(force=True)
+        if auto:
+            self.autoSendDone.emit(sent, failed, self._auto_left)
 
     def _rescan_navidrome(self, msg, error):
         from . import navidrome

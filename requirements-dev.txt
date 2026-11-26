@@ -1,0 +1,6 @@
+# What the tests need. The app itself is installed by install.sh.
+PySide6
+pytest
+mutagen
+requests
+keyring

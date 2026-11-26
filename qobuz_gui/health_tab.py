@@ -11,12 +11,12 @@ from PySide6.QtWidgets import (
     QProgressBar, QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from . import doctor, history, musicbrainz, navidrome, prefs, rules, safeio
+from . import automation, doctor, history, matching, musicbrainz, navidrome, prefs, qobuz_guard, rules, safeio, studio, theme, wikipedia
 from .client import run_async
 from .library_tab import library_folder
+from .studio_dialog import StudioCompare
 
 IGNORED = rules.EXCEPTIONS
-GREEN, AMBER, RED = QColor("#3fa65a"), QColor("#c99a2e"), QColor("#e5534b")
 FIX_TEXT = {
     doctor.DUPLICATE: "Move the extra copies to the replaced bin",
     doctor.LOCATION: "Move the artist folder to the right letter",
@@ -33,10 +33,14 @@ class ScanWorker(QThread):
     progressed = Signal(int, int, str)
     finishedScan = Signal(object, object, str)     # issues, completion, error
 
-    def __init__(self, session, use_mb):
+    def __init__(self, session, use_mb, choice=None, use_qobuz=False, only=None):
         super().__init__()
-        self.session = session
+        self.session = session                       # a session.background(): counted against the daily budget
         self.use_mb = use_mb
+        self.choice = choice or studio.Choice()      # read on the GUI thread, used on this one
+        self.use_qobuz = use_qobuz
+        self.only = only
+        self.note = ""
         self._stop = False
 
     def stop(self):
@@ -47,11 +51,75 @@ class ScanWorker(QThread):
             scanner = doctor.Scanner(self.session, library_folder(), use_musicbrainz=self.use_mb,
                                      progress=lambda n, t, a: self.progressed.emit(n, t, a),
                                      should_stop=lambda: self._stop,
-                                     prefer_explicit=prefs.get_bool(prefs.PREFER_EXPLICIT, True))
+                                     prefer_explicit=prefs.get_bool(prefs.PREFER_EXPLICIT, True),
+                                     studio=self.choice, use_qobuz=self.use_qobuz, only_artists=self.only)
             issues, completion = scanner.run()
+            self.note = scanner.note
             self.finishedScan.emit(issues, completion, "")
         except Exception as e:
             self.finishedScan.emit([], [], str(e) or e.__class__.__name__)
+
+
+def build_fix_plans(file_fixes, lib):
+    """Builds one safeio.Plan per fix (covers are downloaded first so the preview is exact).
+    Returns (plans, problems). Run from a worker thread."""
+    import requests
+    from . import library as L
+    plans, problems = [], []
+    for i in file_fixes:
+        try:
+            if not i.folder:
+                raise ValueError("couldn't find the album folder")
+            if i.kind == doctor.NO_COVER:
+                if not i.cover_url:
+                    raise ValueError("no cover to download: run Check on Qobuz for this artist first")
+                r = requests.get(i.cover_url, timeout=30)
+                r.raise_for_status()
+                plan = safeio.Plan(f"Add cover — {i.artist} — {i.album}", lib)
+                plan.add_file(os.path.join(i.folder, "cover.jpg"), r.content)
+            elif i.kind == doctor.DUPLICATE:
+                retire = [f for f in i.extra.get("retire") or [] if os.path.isdir(f)]
+                if not retire:
+                    raise ValueError("couldn't confirm which folders are the extra copies — "
+                                     "open the folder and sort it by hand, or mark it as an exception")
+                plan = safeio.Plan(f"Keep one copy — {i.artist} — {i.album}", lib)
+                for f in retire:
+                    plan.retire(f)
+            elif i.kind == doctor.LOCATION:
+                dst = i.extra.get("to") or ""
+                if not dst:
+                    raise ValueError("this folder needs sorting by hand")
+                if os.path.lexists(dst):
+                    raise ValueError(f"{dst} already exists — merge the two folders by hand")
+                plan = safeio.Plan(f"Move {i.artist} to {os.path.basename(os.path.dirname(dst))}", lib)
+                plan.relocate(i.folder, dst)
+            elif i.kind == doctor.SPLIT:
+                artist = i.extra.get("album_artist") or i.artist
+                plan = safeio.Plan(f"One album artist ({artist}) — {i.album}", lib)
+                for root, _, files in os.walk(i.folder):
+                    for f in sorted(files):
+                        if os.path.splitext(f)[1].lower() in L.AUDIO_EXT:
+                            plan.set_tags(os.path.join(root, f), {"albumartist": [artist]})
+            else:
+                plan = safeio.Plan(f"Move unofficial release to bin — {i.artist} — {i.album}", lib)
+                plan.retire(i.folder)
+            plans.append((i, plan))
+        except Exception as e:
+            problems.append((i, str(e)))
+    return plans, problems
+
+
+
+def run_fix_plans(plans, problems=()):
+    """Executes the plans into History. Returns (done issues, [(issue, error)])."""
+    done, failed = [], list(problems)
+    for i, plan in plans:
+        try:
+            plan.execute(history.journal())
+            done.append(i)
+        except Exception as e:
+            failed.append((i, str(e)))
+    return done, failed
 
 
 def _cell(text, tip=None, colour=None, align=None):
@@ -65,8 +133,15 @@ def _cell(text, tip=None, colour=None, align=None):
 
 
 class HealthTab(QWidget):
+    # previous completion, issues, completion, quiet (started by the background check)
+    scanFinished = Signal(object, object, object, bool)
+    scanFailed = Signal(str, bool)          # reason, quiet — a failed or stopped scan
+
     def __init__(self, session, download_tab, status, parent=None):
         super().__init__(parent)
+        self._quiet = False
+        self._partial = None             # artists of a "Check on Qobuz" run (merged into the results), else None
+        self._previous = []
         self.session = session
         self.download_tab = download_tab
         self.status = status
@@ -79,7 +154,7 @@ class HealthTab(QWidget):
         self.btn_scan.setDefault(True)
         self.btn_stop = QPushButton("Stop")
         self.btn_stop.setVisible(False)
-        self.use_mb = QCheckBox("Check official releases on MusicBrainz")
+        self.use_mb = QCheckBox("MusicBrainz check (Qobuz checks only)")
         self.use_mb.setChecked(prefs.get_bool("doctor_use_mb", True))
         self.use_mb.setToolTip(musicbrainz.LIMITATION)
         self.progress = QProgressBar()
@@ -96,10 +171,12 @@ class HealthTab(QWidget):
         bar.addWidget(self.use_mb)
         bar.addWidget(self.progress, 1)
         bar.addWidget(self.last_scan, 1)
-        note = QLabel("The scan reads your library from Navidrome and compares it with Qobuz, pausing between "
-                      "Qobuz requests to keep your account safe. MusicBrainz allows 1 request per second, so the "
-                      "first full scan of a big library can take a while (it runs in the background and you can "
-                      "keep using the app). Later scans reuse what was already checked and are much faster.")
+        note = QLabel("The scan reads your library from Navidrome and checks your folders: duplicates, wrong letter, "
+                      "split albums, missing covers. Complete my artists compares your albums with Wikipedia's "
+                      "studio-album lists (one request a second, and answers are kept for 30 days, so the first "
+                      "scan of a big library is slow and later ones are quick). It does not contact Qobuz. The "
+                      "checks that need Qobuz's catalogue (Hi-Res or explicit version available, missing tracks, "
+                      "covers to download) run only for artists you choose, in Complete my artists → Check on Qobuz.")
         note.setWordWrap(True)
         note.setEnabled(False)
 
@@ -220,7 +297,7 @@ class HealthTab(QWidget):
             check.setCheckState(Qt.Unchecked)
             check.setData(Qt.UserRole, self.issues.index(issue))
             self.table.setItem(r, 0, check)
-            colour = AMBER if issue.kind in (doctor.UNOFFICIAL, doctor.SPLIT, doctor.MISSING_TRACKS,
+            colour = QColor(theme.WARN) if issue.kind in (doctor.UNOFFICIAL, doctor.SPLIT, doctor.MISSING_TRACKS,
                                              doctor.DUPLICATE, doctor.LOCATION) else None
             label = issue.extra.get("label") or doctor.LABELS[issue.kind]
             if issue.key in ignored:
@@ -243,7 +320,7 @@ class HealthTab(QWidget):
             breaks = sum(1 for i in self.issues if i.kind in kinds and i.key not in ignored)
             exc = sum(1 for i in self.issues if i.kind in kinds and i.key in ignored)
             mark = "✔" if not breaks else "✘"
-            colour = "#3fa65a" if not breaks else "#c99a2e"
+            colour = theme.OK if not breaks else theme.WARN
             parts.append(f"<span style='color:{colour}'>{mark}</span> <b>{code}</b> {html.escape(name)}: "
                          f"{breaks}" + (f" <i>(+{exc} exception{'s' if exc != 1 else ''})</i>" if exc else ""))
         self.rules_line.setText("&nbsp;&nbsp;·&nbsp;&nbsp;".join(parts) if self.issues is not None else "")
@@ -328,53 +405,6 @@ class HealthTab(QWidget):
         if not history.ensure_library(self, lib):
             return
 
-        def build():
-            """Builds one plan per fix (covers are downloaded first so the preview is exact)."""
-            import requests
-            from . import library as L
-            plans, problems = [], []
-            for i in file_fixes:
-                try:
-                    if not i.folder:
-                        raise ValueError("couldn't find the album folder")
-                    if i.kind == doctor.NO_COVER:
-                        if not i.cover_url:
-                            raise ValueError("Qobuz has no matching album to take a cover from")
-                        r = requests.get(i.cover_url, timeout=30)
-                        r.raise_for_status()
-                        plan = safeio.Plan(f"Add cover — {i.artist} — {i.album}", lib)
-                        plan.add_file(os.path.join(i.folder, "cover.jpg"), r.content)
-                    elif i.kind == doctor.DUPLICATE:
-                        retire = [f for f in i.extra.get("retire") or [] if os.path.isdir(f)]
-                        if not retire:
-                            raise ValueError("couldn't confirm which folders are the extra copies — "
-                                             "open the folder and sort it by hand, or mark it as an exception")
-                        plan = safeio.Plan(f"Keep one copy — {i.artist} — {i.album}", lib)
-                        for f in retire:
-                            plan.retire(f)
-                    elif i.kind == doctor.LOCATION:
-                        dst = i.extra.get("to") or ""
-                        if not dst:
-                            raise ValueError("this folder needs sorting by hand")
-                        if os.path.lexists(dst):
-                            raise ValueError(f"{dst} already exists — merge the two folders by hand")
-                        plan = safeio.Plan(f"Move {i.artist} to {os.path.basename(os.path.dirname(dst))}", lib)
-                        plan.relocate(i.folder, dst)
-                    elif i.kind == doctor.SPLIT:
-                        artist = i.extra.get("album_artist") or i.artist
-                        plan = safeio.Plan(f"One album artist ({artist}) — {i.album}", lib)
-                        for root, _, files in os.walk(i.folder):
-                            for f in sorted(files):
-                                if os.path.splitext(f)[1].lower() in L.AUDIO_EXT:
-                                    plan.set_tags(os.path.join(root, f), {"albumartist": [artist]})
-                    else:
-                        plan = safeio.Plan(f"Move unofficial release to bin — {i.artist} — {i.album}", lib)
-                        plan.retire(i.folder)
-                    plans.append((i, plan))
-                except Exception as e:
-                    problems.append((i, str(e)))
-            return plans, problems
-
         def built(result):
             plans, problems = result
             if not plans:
@@ -384,16 +414,7 @@ class HealthTab(QWidget):
             if not history.preview(self, "Fix library problems", [p for _, p in plans]):
                 return
 
-            def work():
-                done, failed = [], list(problems)
-                for i, plan in plans:
-                    try:
-                        plan.execute(history.journal())
-                        done.append(i)
-                    except Exception as e:
-                        failed.append((i, str(e)))
-                return done, failed
-            run_async(work, finished, lambda m: self.status(f"Fixing failed: {m}", error=True))
+            run_async(lambda: run_fix_plans(plans, problems), finished, lambda m: self.status(f"Fixing failed: {m}", error=True))
 
         def finished(result):
             done, failed = result
@@ -411,7 +432,7 @@ class HealthTab(QWidget):
             if done:
                 self._rescan()
 
-        run_async(build, built, lambda m: self.status(f"Preparing fixes failed: {m}", error=True))
+        run_async(lambda: build_fix_plans(file_fixes, lib), built, lambda m: self.status(f"Preparing fixes failed: {m}", error=True))
 
     def _rescan(self):
         if navidrome.configured() and prefs.get_bool(prefs.NAVIDROME_RESCAN, True):
@@ -456,12 +477,23 @@ class HealthTab(QWidget):
             mh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
         self.btn_get_missing = QPushButton("Download ticked")
         self.btn_get_all = QPushButton("Download everything missing for selected artists")
+        self.btn_compare = QPushButton("Compare Qobuz / Wikipedia…")
+        self.btn_compare.setToolTip("See both lists of studio albums for this artist side by side and choose "
+                                    "which one to count (remembered for this artist)")
+        self.btn_compare.setEnabled(False)
+        self.btn_qobuz_check = QPushButton("Check on Qobuz…")
+        self.btn_qobuz_check.setEnabled(not prefs.safe_mode())
+        self.btn_qobuz_check.setToolTip("Hi-Res / explicit version available, missing tracks, covers to download — "
+                                        "for the selected artists only, within today's Qobuz request limit "
+                                        "(Settings → Qobuz contact). Nothing contacts Qobuz in the background.")
         right = QWidget()
         rv = QVBoxLayout(right)
         rv.setContentsMargins(0, 0, 0, 0)
         rv.addWidget(self.missing_title)
         rv.addWidget(self.missing_table, 1)
         rb = QHBoxLayout()
+        rb.addWidget(self.btn_compare)
+        rb.addWidget(self.btn_qobuz_check)
         rb.addWidget(self.btn_get_all)
         rb.addStretch(1)
         rb.addWidget(self.btn_get_missing)
@@ -489,6 +521,8 @@ class HealthTab(QWidget):
         self.art_table.itemSelectionChanged.connect(self._show_missing)
         self.btn_get_missing.clicked.connect(self._download_ticked_missing)
         self.btn_get_all.clicked.connect(self._download_all_missing)
+        self.btn_compare.clicked.connect(self._compare_lists)
+        self.btn_qobuz_check.clicked.connect(self._qobuz_check)
         return w
 
     def _sorted_completion(self):
@@ -506,14 +540,18 @@ class HealthTab(QWidget):
         rows = self._sorted_completion()
         self.art_table.setRowCount(len(rows))
         for r, c in enumerate(rows):
-            name = _cell(c.artist + ("" if c.verified else "  ·  unverified"),
-                         tip=("Checked against MusicBrainz's official list" if c.verified
-                              else "Not checked on MusicBrainz — based on Qobuz's release types"))
+            if c.source == studio.WIKI:
+                name = _cell(c.artist + "  ·  Wikipedia", tip=f"Studio albums from Wikipedia ({c.note})")
+            else:
+                name = _cell(c.artist + ("" if c.verified else "  ·  unverified"),
+                             tip=(c.note + "\n" if c.note else "") + (
+                                 "Checked against MusicBrainz's official list" if c.verified
+                                 else "Not checked on MusicBrainz — based on Qobuz's release types"))
             name.setData(Qt.UserRole, self.completion.index(c))
             self.art_table.setItem(r, 0, name)
             self.art_table.setItem(r, 1, _cell(f"{c.owned} of {c.total}", align=Qt.AlignCenter))
             pct = int(round(100 * c.owned / c.total))
-            self.art_table.setItem(r, 2, _cell(f"{pct}%", colour=GREEN if pct == 100 else None, align=Qt.AlignCenter))
+            self.art_table.setItem(r, 2, _cell(f"{pct}%", colour=QColor(theme.OK) if pct == 100 else None, align=Qt.AlignCenter))
             self.art_table.setItem(r, 3, _cell(str(len(c.missing)), align=Qt.AlignCenter))
         done = sum(1 for c in self.completion if c.total and not c.missing)
         self.art_summary.setText(f"{done} of {sum(1 for c in self.completion if c.total)} artists complete")
@@ -524,6 +562,7 @@ class HealthTab(QWidget):
 
     def _show_missing(self):
         sel = self._selected_artists()
+        self.btn_compare.setEnabled(len(sel) == 1)
         if len(sel) != 1:
             self.missing_table.setRowCount(0)
             self.missing_title.setText(f"{len(sel)} artists selected." if sel else
@@ -531,6 +570,7 @@ class HealthTab(QWidget):
             return
         c = sel[0]
         self.missing_title.setText(f"<b>{html.escape(c.artist)}</b> — {c.owned} of {c.total} studio albums"
+                                   + (f" (from {studio.LABEL[c.source]})" if c.source == studio.WIKI else "")
                                    + ("" if c.missing else " · complete ✔"))
         self.missing_table.setRowCount(len(c.missing))
         for r, m in enumerate(c.missing):
@@ -541,14 +581,98 @@ class HealthTab(QWidget):
             self.missing_table.setItem(r, 0, chk)
             self.missing_table.setItem(r, 1, _cell(m["title"] + (" [E]" if m.get("explicit") else "")))
             self.missing_table.setItem(r, 2, _cell(m.get("year", ""), align=Qt.AlignCenter))
-            self.missing_table.setItem(r, 3, _cell(m.get("quality", "")))
+            self.missing_table.setItem(r, 3, _cell(m.get("quality") or "looked up on Qobuz when you download"))
+
+    def _compare_lists(self, load_qobuz=False):
+        sel = self._selected_artists()
+        if len(sel) != 1:
+            return
+        c = sel[0]
+        lang = studio.Choice.load().lang
+        self.btn_compare.setEnabled(False)
+        self.status(f"Reading {c.artist}'s studio albums from Wikipedia…")
+
+        def work():
+            name = (c.names or [c.artist])[0]
+            if load_qobuz:                       # you pressed "Load Qobuz data": a search and the artist's page
+                qall = doctor.Scanner(self.session, library_folder()).discography_for(c.names or [c.artist])
+            else:                                # otherwise only what an earlier look already saved: no request
+                qall = doctor.cached_discography(c.names or [c.artist])
+            qall = [q for q in qall if matching.artist_matches((q.get("artist") or {}).get("name", ""),
+                                                                c.names or [c.artist])]
+            return qall, wikipedia.studio_albums(name, lang)
+
+        def done(result):
+            self.btn_compare.setEnabled(True)
+            qall, found = result
+            if found is None:
+                QMessageBox.information(self, "Wikipedia", f"Wikipedia has no usable list of studio albums for "
+                                        f"{c.artist}, so Qobuz's list is used.")
+                self.status("")
+                return
+            self.status("")
+            keys = set()
+            for name in c.owned_titles:
+                keys |= matching.library_keys(name)
+            rows = studio.compare(c.qobuz_studio, found["albums"], qall, keys)
+            dlg = StudioCompare(self, c.artist, rows, c.source, found["page"], qobuz_loaded=bool(qall or c.qobuz_studio),
+                                can_load=not prefs.safe_mode())
+            dlg.loadQobuz.connect(lambda: (dlg.accept(), self._compare_lists(load_qobuz=True)))
+
+            def chosen(source):
+                studio.set_source(c.artist, source)
+                c.owned, c.total, c.missing = studio.counts(rows, source)
+                c.source, c.note = source, found["page"] if source == studio.WIKI else ""
+                doctor.save_results(self.issues, self.completion)
+                self._fill_artists()
+                self._show_missing()
+            dlg.sourceChosen.connect(chosen)
+            dlg.downloadRequested.connect(lambda picked: self._queue_missing([(c.artist, {"title": t, "url": u})
+                                                                              for t, u in picked]))
+            dlg.exec()
+
+        def fail(msg):
+            self.btn_compare.setEnabled(True)
+            self.status(f"Couldn't compare: {msg}", error=True)
+        run_async(work, done, fail)
 
     def _queue_missing(self, entries):
+        """Queue downloads for [(artist, {title, url})]. A missing album found through Wikipedia has no Qobuz
+        link yet: it is looked up now (one search each), because you asked for it."""
         added = 0
+        lookup = []
         for artist, m in entries:
-            added += len(self.download_tab.enqueue([m["url"]], title=f"{artist} — {m['title']}"))
+            if m.get("url"):
+                added += len(self.download_tab.enqueue([m["url"]], title=f"{artist} — {m['title']}"))
+            else:
+                lookup.append((artist, m))
         if added:
             self.status(f"Queued {added} missing album{'s' if added != 1 else ''}.")
+        if not lookup:
+            return
+        if prefs.safe_mode() and len(lookup) > prefs.SAFE_LOOKUPS:
+            self.status(f"Safe mode looks up {prefs.SAFE_LOOKUPS} albums on Qobuz per click: press Download again for "
+                        f"the other {len(lookup) - prefs.SAFE_LOOKUPS}.")
+            lookup = lookup[:prefs.SAFE_LOOKUPS]
+        self.status(f"Looking up {len(lookup)} album{'s' if len(lookup) != 1 else ''} on Qobuz…")
+
+        def work():
+            found, missing = [], []
+            for artist, m in lookup:
+                album = self.session.find_album(artist, m["title"])
+                (found if album else missing).append((artist, m, album))
+            return found, missing
+
+        def done(result):
+            found, missing = result
+            n = sum(len(self.download_tab.enqueue([f"https://play.qobuz.com/album/{al['id']}"],
+                                                  title=f"{artist} — {m['title']}")) for artist, m, al in found)
+            text = f"Queued {added + n} album{'s' if added + n != 1 else ''}."
+            if missing:
+                text += " Not found on Qobuz: " + "; ".join(f"{a} — {m['title']}" for a, m, _ in missing[:4]) + \
+                    (" …" if len(missing) > 4 else "")
+            self.status(text, error=bool(missing))
+        run_async(work, done, lambda m: self.status(f"Couldn't look the albums up on Qobuz: {m}", error=True))
 
     def _download_ticked_missing(self):
         sel = self._selected_artists()
@@ -565,9 +689,12 @@ class HealthTab(QWidget):
         entries = [(c.artist, m) for c in sel for m in c.missing]
         if not entries:
             return
+        lookups = sum(1 for _a, m in entries if not m.get("url"))
+        extra = (f"\n\n{lookups} of them have no Qobuz link yet: each needs one Qobuz search first (about a second "
+                 "apart)." if lookups else "")
         if QMessageBox.question(self, "Download missing albums",
                                 f"Queue {len(entries)} missing studio albums from {len(sel)} "
-                                f"artist{'s' if len(sel) != 1 else ''}?") != QMessageBox.Yes:
+                                f"artist{'s' if len(sel) != 1 else ''}?{extra}") != QMessageBox.Yes:
             return
         self._queue_missing(entries)
 
@@ -595,21 +722,73 @@ class HealthTab(QWidget):
             self.status("The library report failed — see the log.", error=True)
 
     # ================= scanning ==================================================
-    def scan(self):
+    def scan(self, quiet=False):
+        """Starts a scan. quiet: started by the background check (no dialogs). True when started."""
+        if self.busy():
+            return False
         if not navidrome.configured():
-            QMessageBox.information(self, "Library doctor", "Set up the Navidrome connection in Settings first — "
-                                    "the doctor reads your library from Navidrome.")
-            return
-        self.worker = ScanWorker(self.session, self.use_mb.isChecked())
+            if not quiet:
+                QMessageBox.information(self, "Library doctor", "Set up the Navidrome connection in Settings "
+                                        "first — the doctor reads your library from Navidrome.")
+            return False
+        self._quiet = quiet
+        self._previous = list(self.completion)
+        self._partial = None
+        return self._run(ScanWorker(self.session.background(), self.use_mb.isChecked(), studio.Choice.load()),
+                         "Reading the library from Navidrome…")
+
+    def _run(self, worker, label):
+        self.worker = worker
         self.worker.progressed.connect(self._progress)
         self.worker.finishedScan.connect(self._finished)
         self.btn_scan.setEnabled(False)
+        self.btn_qobuz_check.setEnabled(False)
         self.btn_stop.setVisible(True)
         self.progress.setVisible(True)
         self.progress.setValue(0)
-        self.progress.setFormat("Reading the library from Navidrome…")
+        self.progress.setFormat(label)
         self.last_scan.setVisible(False)
         self.worker.start()
+        return True
+
+    def _qobuz_check(self):
+        """Complete my artists → Check on Qobuz: the Qobuz-based checks for the chosen artists only."""
+        if self.busy():
+            return
+        sel = self._selected_artists()
+        if not sel:
+            QMessageBox.information(self, "Check on Qobuz", "Select the artists to check first.")
+            return
+        if not navidrome.configured():
+            QMessageBox.information(self, "Check on Qobuz", "Set up the Navidrome connection in Settings first.")
+            return
+        message = qobuz_guard.guard.blocked_message()
+        if message:
+            QMessageBox.warning(self, "Qobuz is paused", message)
+            return
+        if prefs.safe_mode():
+            QMessageBox.information(self, "Check on Qobuz", "Safe mode is on, so this is switched off. It keeps your "
+                                    "Qobuz traffic to the minimum. Turn safe mode off in Settings → Qobuz contact "
+                                    "if you want these checks.")
+            return
+        budget = prefs.qobuz_budget()
+        used = qobuz_guard.guard.used_today()
+        if budget <= 0:
+            QMessageBox.information(self, "Check on Qobuz", "Background Qobuz requests are switched off. To allow a "
+                                    "few per day, set a limit in Settings → Qobuz contact.")
+            return
+        qobuz_guard.guard.configure(budget=budget)
+        if QMessageBox.question(
+                self, "Check on Qobuz",
+                f"This asks Qobuz about {len(sel)} artist{'s' if len(sel) != 1 else ''}: roughly 2 to 5 requests each, "
+                f"spaced out, from today's limit ({used} of {budget} used). It stops by itself when the limit is "
+                "reached, or at once if Qobuz refuses.\n\nContinue?") != QMessageBox.Yes:
+            return
+        self._quiet = False
+        self._previous = list(self.completion)
+        self._partial = [c.artist for c in sel]
+        self._run(ScanWorker(self.session.background(), self.use_mb.isChecked(), studio.Choice.load(),
+                             use_qobuz=True, only=self._partial), "Asking Qobuz about the chosen artists…")
 
     def _progress(self, n, total, artist):
         self.progress.setMaximum(total)
@@ -623,20 +802,72 @@ class HealthTab(QWidget):
 
     def _finished(self, issues, completion, error):
         stopped = self.worker is not None and self.worker._stop
+        note = getattr(self.worker, "note", "")
+        quiet, self._quiet = self._quiet, False
         self.worker = None
         self.btn_scan.setEnabled(True)
+        self.btn_qobuz_check.setEnabled(not prefs.safe_mode())
         self.btn_stop.setVisible(False)
         self.progress.setVisible(False)
         self.last_scan.setVisible(True)
         if error:
             self.status(f"Library scan failed: {error}", error=True)
             self.last_scan.setText(f"Scan failed: {error}")
+            self.scanFailed.emit(error, quiet)
+            return
+        if self._partial is not None:
+            self._merge_partial(issues, completion, stopped, note)
             return
         doctor.save_results(issues, completion)
         self._show_results(issues, completion, None, partial=stopped)
+        if note:
+            self.status(f"Scan note: {note}", error=True)
         stored = self._ignored()
         n = sum(1 for i in issues if not self._is_exception(i, stored))
         self.status(f"Library scan {'stopped' if stopped else 'finished'}: {n} problem{'s' if n != 1 else ''} found.")
+        if stopped:
+            self.scanFailed.emit("the scan was stopped", quiet)
+        else:
+            self.scanFinished.emit(self._previous, self.issues, self.completion, quiet)
+
+    def _merge_partial(self, issues, completion, stopped, note):
+        """A Check on Qobuz run covers some artists: replace only their Qobuz-based results."""
+        artists = set(self._partial or [])
+        self._partial = None
+        kinds = {doctor.UPGRADE, doctor.EXPLICIT, doctor.MISSING_TRACKS, doctor.UNOFFICIAL, doctor.NO_COVER}
+        kept = [i for i in self.issues if not (i.kind in kinds and i.artist in artists)]
+        done = {c.artist for c in completion}
+        merged = [c for c in self.completion if c.artist not in done] + list(completion)
+        doctor.save_results(kept + list(issues), merged)
+        self._show_results(kept + list(issues), merged, None, partial=False)
+        text = f"Checked {len(done)} artist{'s' if len(done) != 1 else ''} on Qobuz"
+        if stopped:
+            text += " (stopped early)"
+        self.status(text + (f". {note}" if note else "."), error=bool(note))
+
+    def apply_safe_fixes(self, kinds, on_done):
+        """Background check: applies the safest fixes (see automation.SAFE_FIX_KINDS) without a
+        preview. Same plans, checksums and History as Fix ticked. on_done(fixed, failed)."""
+        fixes = automation.safe_fixes(self.issues, kinds, self._ignored())
+        lib = library_folder()
+        if not fixes or safeio.library_state(lib) != "ok":
+            on_done(0, 0)
+            return
+
+        def work():
+            plans, problems = build_fix_plans(fixes, lib)
+            return run_fix_plans(plans, problems)
+
+        def finished(result):
+            done, failed = result
+            fixed = {id(i) for i in done}
+            self.issues = [i for i in self.issues if id(i) not in fixed]
+            doctor.save_results(self.issues, self.completion)
+            self._fill_issues()
+            if done:
+                self._rescan()
+            on_done(len(done), len(failed))
+        run_async(work, finished, lambda _m: on_done(0, len(fixes)))
 
     def _show_results(self, issues, completion, when, partial=False):
         self.issues = list(issues)
