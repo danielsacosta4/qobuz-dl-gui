@@ -461,7 +461,7 @@ class Scanner:
         """Complete my artists without Qobuz: Wikipedia's studio list against your library. Downloads are
         looked up on Qobuz only when you click Download, so the missing albums carry no link here."""
         try:
-            found = wikipedia.studio_albums((names or [artist])[0], self.studio.lang)
+            found = self.studio.albums_for(artist, (names or [artist])[0])
         except wikipedia.WikipediaError as e:
             self.note = str(e)
             return None
@@ -478,7 +478,7 @@ class Scanner:
     def _use_wikipedia(self, done, qobuz, owned_keys):
         """Switches a completion over to Wikipedia's list; keeps Qobuz's (with a note) when that fails."""
         try:
-            found = wikipedia.studio_albums((done.names or [done.artist])[0], self.studio.lang)
+            found = self.studio.albums_for(done.artist, (done.names or [done.artist])[0])
         except wikipedia.WikipediaError as e:
             done.note = f"{e} — using Qobuz's list"
             return

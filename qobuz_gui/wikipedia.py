@@ -274,3 +274,39 @@ def studio_albums(artist, lang="en", refresh=False):
     found = _find(artist, lang)
     cache.put("wiki_studio", key, found or {"missing": True})
     return found
+
+
+# ---- a page you name ----------------------------------------------------------------------------------------
+_WIKI_URL = re.compile(r"https?://([a-z\-]+)\.(?:m\.)?wikipedia\.org/wiki/([^?#]+)", re.IGNORECASE)
+
+
+def page_ref(text, lang="en"):
+    """(language, page title) from a Wikipedia address or a plain page title."""
+    from urllib.parse import unquote
+    text = str(text or "").strip()
+    m = _WIKI_URL.match(text)
+    if m:
+        return m.group(1).lower(), unquote(m.group(2)).replace("_", " ").strip()
+    return lang, text.replace("_", " ").strip()
+
+
+def studio_albums_from_page(title, lang="en", refresh=False):
+    """Like studio_albums, but for the page you name. None when the page doesn't exist, is a disambiguation
+    page or has no usable *Studio albums* section. Raises WikipediaError when Wikipedia can't be reached."""
+    key = f"{lang}|page|{str(title).casefold()}"
+    if not refresh:
+        hit = cache.get("wiki_studio", key, FOUND_TTL)
+        if hit is not None:
+            if not hit.get("missing"):
+                return hit
+            if cache.get("wiki_studio", key, MISSING_TTL) is not None:
+                return None
+    found = None
+    pages = _existing(lang, [title])
+    if pages:
+        index = _studio_section(lang, pages[0])
+        albums = parse_section(_section_html(lang, pages[0], index)) if index is not None else []
+        if albums:
+            found = {"albums": albums, "page": pages[0], "lang": lang}
+    cache.put("wiki_studio", key, found or {"missing": True})
+    return found

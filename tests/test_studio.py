@@ -107,3 +107,21 @@ def test_old_saved_results_still_load():
     old = {"artist": "A", "owned": 1, "total": 2, "missing": [], "verified": True}
     c = doctor.ArtistCompletion(**old)
     assert c.source == "qobuz" and c.qobuz_studio == [] and c.owned_titles == []
+
+
+def test_missing_albums_export():
+    from qobuz_gui import doctor
+    comps = [
+        doctor.ArtistCompletion("Zed", 1, 2, [{"title": "Late, \"Quoted\"", "year": "2001", "url": "https://play.qobuz.com/album/9"}], True),
+        doctor.ArtistCompletion("abba", 2, 4, [{"title": "One", "year": "1976", "url": ""}, {"title": "Two", "year": "", "url": ""}],
+                                True, source="wikipedia"),
+        doctor.ArtistCompletion("Complete", 3, 3, [], True),
+    ]
+    rows = studio.missing_rows(comps)
+    assert rows == [["abba", "One", "1976", "Wikipedia", ""], ["abba", "Two", "", "Wikipedia", ""],
+                    ["Zed", 'Late, "Quoted"', "2001", "Qobuz", "https://play.qobuz.com/album/9"]]
+    csv_text = studio.missing_csv(rows)
+    assert csv_text.splitlines()[0] == "Artist,Album,Year,List,Qobuz link"
+    assert '"Late, ""Quoted"""' in csv_text and csv_text.count("\n") == 4
+    assert studio.missing_text(rows) == "abba\n  - One (1976)\n  - Two\n\nZed\n  - Late, \"Quoted\" (2001)\n"
+    assert studio.missing_rows([]) == [] and studio.missing_text([]) == ""

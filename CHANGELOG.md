@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.11.0 — beta (2026-11-26)
+
+- **Correct a studio-album list yourself.** In Compare (Library health → Complete my artists, and Search) you can
+  now **Add album…**, **Remove from list**, **Put back…**, **Use another Wikipedia page…** and **Undo my changes**
+  for an artist. Your corrections are kept per artist and used everywhere the list is: the counts in Complete my
+  artists, the Release column and the "N of M" count in Search, and Discover's latest album. An artist Wikipedia
+  has no list for can get one made of albums you add.
+- **Export missing…** (Complete my artists) saves the missing albums of the selected artists, or of every artist
+  shown, as a CSV or text file.
+- **Queue control**: **Retry** a failed or stopped download, move waiting jobs **↑ / ↓**, and **Pause after this
+  job** (also on right-click). The order is remembered when you close the app.
+- Under the hood: the Search tab's code is split into smaller files, and the in-app updater, list corrections,
+  export and queue are covered by automatic tests (106 in all).
+- None of this adds Qobuz requests.
+
 ## 0.10.1 — beta (2026-11-15)
 
 - **Safe mode, on by default** (Settings → Qobuz contact), to keep Qobuz traffic to the minimum. While it's on:

@@ -113,6 +113,7 @@ class MainWindow(QMainWindow):
         self.runner.blocked.connect(self._qobuz_blocked)
         self.runner.jobChanged.connect(self._job_changed)
         self.runner.jobAdded.connect(lambda _j: self._save_queue())
+        self.runner.queueChanged.connect(self._save_queue)
         self.library.librarySent.connect(self.rebuild_index)
         self.library.autoSendDone.connect(self._auto_sent)
         self.health.scanFinished.connect(self._scan_finished)

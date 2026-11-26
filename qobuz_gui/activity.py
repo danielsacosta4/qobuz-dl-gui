@@ -5,7 +5,7 @@ import time
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFontDatabase, QKeySequence, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
+    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox,
     QProgressBar, QPushButton, QSplitter, QTextEdit, QVBoxLayout, QWidget,
 )
 
@@ -49,11 +49,27 @@ class ActivityPanel(QWidget):
         q_buttons = QHBoxLayout()
         q_buttons.addWidget(self.btn_remove)
         q_buttons.addWidget(self.btn_clear)
+        self.btn_retry = QPushButton("Retry")
+        self.btn_retry.setToolTip("Queue the selected failed or stopped download again")
+        self.btn_up = QPushButton("↑")
+        self.btn_up.setToolTip("Move the selected waiting job up")
+        self.btn_down = QPushButton("↓")
+        self.btn_down.setToolTip("Move the selected waiting job down")
+        self.btn_pause = QPushButton("Pause after this job")
+        self.btn_pause.setCheckable(True)
+        self.btn_pause.setToolTip("The running job finishes; nothing else starts until you resume")
+        q_order = QHBoxLayout()
+        q_order.addWidget(self.btn_retry)
+        q_order.addWidget(self.btn_up)
+        q_order.addWidget(self.btn_down)
+        q_order.addWidget(self.btn_pause, 1)
+        self.queue.setContextMenuPolicy(Qt.CustomContextMenu)
         q_box = QVBoxLayout()
         q_box.setContentsMargins(0, 0, 0, 0)
         q_box.addWidget(q_title)
         q_box.addWidget(self.queue, 1)
         q_box.addLayout(q_buttons)
+        q_box.addLayout(q_order)
         q_widget = QWidget()
         q_widget.setLayout(q_box)
 
@@ -129,6 +145,14 @@ class ActivityPanel(QWidget):
         self.btn_stop_all.clicked.connect(self._stop_all)
         self.btn_remove.clicked.connect(self._remove_selected)
         self.btn_clear.clicked.connect(self._clear_finished)
+        self.btn_retry.clicked.connect(self._retry_selected)
+        self.btn_up.clicked.connect(lambda: self._move_selected(-1))
+        self.btn_down.clicked.connect(lambda: self._move_selected(1))
+        self.btn_pause.toggled.connect(runner.set_paused)
+        runner.queueChanged.connect(self._queue_changed)
+        self.queue.currentItemChanged.connect(lambda *_: self._update_queue_buttons())
+        self.queue.customContextMenuRequested.connect(self._queue_menu)
+        self._update_queue_buttons()
         self.answer.returnPressed.connect(self._send_answer)
         self.btn_copy.clicked.connect(self._copy_log)
         self.btn_clear_log.clicked.connect(self.log.clear)
@@ -148,6 +172,9 @@ class ActivityPanel(QWidget):
         self.items[job.id] = (item, job)
         self.queue.addItem(item)
         self._render(job)
+        self._update_queue_buttons()
+        if not self.runner.busy():
+            self._show_paused()               # added while paused: say so instead of "Idle"
 
     def _job_changed(self, job):
         if job.status == "running":
@@ -161,6 +188,9 @@ class ActivityPanel(QWidget):
         self.btn_stop.setEnabled(running)
         self.btn_stop_all.setEnabled(running or bool(self.runner.pending()))
         self.answer.setEnabled(running)
+        self._update_queue_buttons()
+        if not running:
+            self._show_paused()
 
     def _render(self, job):
         entry = self.items.get(job.id)
@@ -186,6 +216,70 @@ class ActivityPanel(QWidget):
             left = (sum(times) / len(times)) * (n - finished - (self._percent / 100 if running else 0))
             text += f" · {_about(left)} left"
         self.overall.setFormat(text)
+
+    # ---- retry, order and pause -------------------------------------------------
+    def _selected_job(self):
+        item = self.queue.currentItem()
+        entry = self.items.get(item.data(Qt.UserRole)) if item else None
+        return entry[1] if entry else None
+
+    def _update_queue_buttons(self):
+        job = self._selected_job()
+        waiting = self.runner.pending()
+        self.btn_retry.setEnabled(bool(job and job.status in ("failed", "stopped") and not job.program))
+        self.btn_up.setEnabled(bool(job in waiting and waiting.index(job) > 0))
+        self.btn_down.setEnabled(bool(job in waiting and waiting.index(job) < len(waiting) - 1))
+
+    def _retry_selected(self):
+        job = self._selected_job()
+        new = self.runner.retry(job) if job else None
+        if new is not None:
+            self.queue.setCurrentItem(self.items[new.id][0])
+
+    def _move_selected(self, delta):
+        job = self._selected_job()
+        if job:
+            self.runner.move(job, delta)
+
+    def _queue_changed(self):
+        """The runner's order or pause changed: show the list in the same order."""
+        order = {j.id: n for n, j in enumerate(self.runner.jobs)}
+        current = self.queue.currentItem()
+        items = [self.queue.takeItem(0) for _ in range(self.queue.count())]
+        items.sort(key=lambda it: order.get(it.data(Qt.UserRole), len(order)))
+        for it in items:
+            self.queue.addItem(it)
+        if current is not None:
+            self.queue.setCurrentItem(current)
+        if self.btn_pause.isChecked() != self.runner.paused:
+            self.btn_pause.blockSignals(True)
+            self.btn_pause.setChecked(self.runner.paused)
+            self.btn_pause.blockSignals(False)
+        self.btn_pause.setText("Resume the queue" if self.runner.paused else "Pause after this job")
+        self._update_queue_buttons()
+        if not self.runner.busy():
+            self._show_paused()
+
+    def _show_paused(self):
+        if self.runner.paused and self.runner.pending():
+            n = len(self.runner.pending())
+            self.progress.setFormat(f"Paused — {n} job{'s' if n != 1 else ''} waiting")
+        elif not self.runner.busy():
+            self.progress.setFormat("Idle")
+
+    def _queue_menu(self, pos):
+        item = self.queue.itemAt(pos)
+        if item is None:
+            return
+        self.queue.setCurrentItem(item)
+        menu = QMenu(self)
+        for label, button, slot in (("Retry", self.btn_retry, self._retry_selected),
+                                    ("Move up", self.btn_up, lambda: self._move_selected(-1)),
+                                    ("Move down", self.btn_down, lambda: self._move_selected(1)),
+                                    ("Remove", self.btn_remove, self._remove_selected)):
+            action = menu.addAction(label, slot)
+            action.setEnabled(button.isEnabled())
+        menu.exec(self.queue.viewport().mapToGlobal(pos))
 
     def _remove_selected(self):
         item = self.queue.currentItem()

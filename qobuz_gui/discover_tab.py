@@ -21,7 +21,7 @@ def _wiki_list(name, choice):
     if choice.source_for(name) != studio.WIKI:
         return None
     try:
-        found = wikipedia.studio_albums(name, choice.lang)
+        found = choice.albums_for(name)
     except wikipedia.WikipediaError:
         return None
     return found["albums"] if found else None
